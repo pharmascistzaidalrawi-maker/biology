@@ -1,0 +1,2 @@
+"""محتوى الأحياء المنظّم حسب الفصول والمحاضرات."""
+from biology_data import CHAPTER_COUNT, PLAYLISTS, LECTURE_SUPPLEMENTS, CHAPTER_PREPARATION_DISTRIBUTION, PREPARATIONS, NEXT_PREPARATIONS

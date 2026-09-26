@@ -1,0 +1,93 @@
+services:
+  - type: web
+    name: almujtahid-biology-bot
+    runtime: docker
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TIMEZONE
+        value: Asia/Baghdad
+      - key: OWNER_CHAT_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: FOUNDER_IDS
+        sync: false
+      - key: OWNER_USERNAME
+        sync: false
+      - key: BIOLOGY_GROUP_ID
+        sync: false
+      - key: ACTIVATION_GROUP_ID
+        sync: false
+      - key: PREPARATION_TOPIC_ID
+        sync: false
+      - key: HOMEWORK_TOPIC_ID
+        sync: false
+      - key: EXAM_TOPIC_ID
+        sync: false
+      - key: SCHOOL_REVIEW_TOPIC_ID
+        sync: false
+      - key: WARNINGS_TOPIC_ID
+        sync: false
+      - key: CHAMPIONS_TOPIC_ID
+        sync: false
+      - key: HOMEWORK_GROUP_ID
+        sync: false
+      - key: EXAM_GROUP_ID
+        sync: false
+      - key: HOMEWORK_SUBMISSIONS_CHAT_ID
+        sync: false
+      - key: EXAM_SUBMISSIONS_CHAT_ID
+        sync: false
+      - key: REQUIRED_CHANNEL
+        value: "@almujtahid_platform"
+      - key: REQUIRED_CHANNEL_URL
+        value: https://t.me/almujtahid_platform
+      - key: GROUP_INVITE_URL
+        sync: false
+      - key: DB_POOL_MIN
+        value: "0"
+      - key: DB_POOL_MAX
+        value: "4"
+      - key: DB_POOL_MAX_IDLE
+        value: "120"
+      - key: DB_CONNECT_TIMEOUT
+        value: "10"
+      - key: NEON_ECO_MODE
+        value: "1"
+      - key: NEON_ECO_INTERVAL_SECONDS
+        value: "1800"
+      - key: NEON_BACKGROUND_INTERVAL_SECONDS
+        value: "21600"
+      - key: NEON_ACTIVITY_SWEEP_SECONDS
+        value: "300"
+      - key: USE_DATABASE_INSTANCE_LOCK
+        value: "0"
+      - key: DEFAULT_HOMEWORK_HOURS
+        value: "24"
+      - key: MIN_LECTURE_WATCH_MINUTES
+        value: "30"
+      - key: ACTIVATION_GRACE_HOURS
+        value: "24"
+      - key: EXAM_ENFORCEMENT_START_DATE_V46
+        value: "2026-09-27"
+      - key: LATE_EXAM_XP_COST
+        value: "150"
+      - key: SUBMISSION_RETRY_SECONDS
+        value: "60"
+      - key: SUBMISSION_MAX_RETRIES
+        value: "20"
+      - key: DELETE_STUDENT_ANSWER_AFTER_DELIVERY
+        value: "1"
+      - key: ANSWER_CLEANUP_LOOKBACK_DAYS
+        value: "7"
+      - key: TELEGRAM_DELETE_LIMIT_HOURS
+        value: "47"
+      - key: REPORT_FONT_PATH
+        value: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+      - key: PYTHONUNBUFFERED
+        value: "1"

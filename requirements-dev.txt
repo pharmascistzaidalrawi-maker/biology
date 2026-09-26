@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=8.0,<9
+pglast>=7.0,<8
