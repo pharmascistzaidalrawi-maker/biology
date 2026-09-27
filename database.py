@@ -462,6 +462,11 @@ def init_db():
 async def register_student(user_id, username, full_name, school, target_grade):
     def op():
         with connect() as conn, conn.cursor() as cur:
+            # A Telegram account can hold exactly one role. The advisory lock also
+            # serializes simultaneous registration and parent-link callbacks.
+            cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);",(user_id,))
+            cur.execute("SELECT 1 FROM biology_parent_links WHERE parent_chat_id=%s LIMIT 1;",(user_id,))
+            if cur.fetchone(): return {"status":"parent_account"}
             cur.execute("""INSERT INTO biology_students(user_id,username,full_name,school,target_grade,approved)
             VALUES(%s,%s,%s,%s,%s,FALSE) ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username,
             full_name=EXCLUDED.full_name,school=EXCLUDED.school,target_grade=EXCLUDED.target_grade,
@@ -1590,6 +1595,9 @@ async def save_exam_correction(task_id,user_id,payload_type,file_id,grade,correc
 async def link_parent(parent_link_code,parent_chat_id,parent_username=None,parent_full_name=None,notify_student=True):
     def op():
         with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);",(parent_chat_id,))
+            cur.execute("SELECT 1 FROM biology_students WHERE user_id=%s LIMIT 1;",(parent_chat_id,))
+            if cur.fetchone(): return {"status":"student_account"}
             cur.execute("SELECT * FROM biology_students WHERE UPPER(parent_link_code)=UPPER(%s);",(parent_link_code,)); row=cur.fetchone()
             if not row: return None
             if row["user_id"]==parent_chat_id: return {"status":"self_parent_forbidden","full_name":row["full_name"],"user_id":row["user_id"]}
@@ -7803,3 +7811,60 @@ async def v29_create_or_get_exam_task(definition_id,user_id,available_at=None,ap
                 (int(task['id']),int(user_id),'approved' if approved else 'pending'))
             conn.commit(); return updated
     return await run(op)
+
+
+async def delete_parent_account(parent_chat_id):
+    """Remove every parent link and reassign primary guardians atomically."""
+    def op():
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);",(parent_chat_id,))
+            cur.execute("SELECT 1 FROM biology_students WHERE user_id=%s LIMIT 1;",(parent_chat_id,))
+            if cur.fetchone(): return {"status":"student_account"}
+            cur.execute("SELECT DISTINCT student_id FROM biology_parent_links WHERE parent_chat_id=%s ORDER BY student_id;",(parent_chat_id,))
+            affected=[r['student_id'] for r in cur.fetchall()]
+            if not affected: return {"status":"not_parent"}
+            cur.execute("DELETE FROM biology_parent_links WHERE parent_chat_id=%s;",(parent_chat_id,))
+            cur.execute("DELETE FROM biology_communication_routes WHERE chat_id=%s AND role='parent';",(parent_chat_id,))
+            for student_id in affected:
+                cur.execute("SELECT parent_chat_id,parent_username,parent_full_name,parent_approved FROM biology_students WHERE user_id=%s FOR UPDATE;",(student_id,))
+                student=cur.fetchone()
+                if student and student['parent_chat_id']==parent_chat_id:
+                    cur.execute("SELECT parent_chat_id,parent_username,parent_full_name,approved FROM biology_parent_links WHERE student_id=%s AND approved=TRUE ORDER BY linked_at,parent_chat_id LIMIT 1;",(student_id,))
+                    replacement=cur.fetchone()
+                    cur.execute("""UPDATE biology_students SET parent_chat_id=%s,parent_username=%s,
+                        parent_full_name=%s,parent_approved=%s WHERE user_id=%s;""",
+                        (replacement['parent_chat_id'] if replacement else None,
+                         replacement['parent_username'] if replacement else None,
+                         replacement['parent_full_name'] if replacement else None,
+                         bool(replacement),student_id))
+            conn.commit()
+            return {"status":"deleted","students":affected}
+    return await run(op)
+
+
+_parent_roles_previous_init_db=init_db
+def init_db():
+    """Remove inherited dual-role parent links once the existing schema is ready."""
+    _parent_roles_previous_init_db()
+    with connect() as conn,conn.cursor() as cur:
+        cur.execute("""SELECT DISTINCT p.parent_chat_id FROM biology_parent_links p
+            JOIN biology_students s ON s.user_id=p.parent_chat_id ORDER BY p.parent_chat_id;""")
+        dual_ids=[r['parent_chat_id'] for r in cur.fetchall()]
+        for parent_id in dual_ids:
+            cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);",(parent_id,))
+            cur.execute("DELETE FROM biology_parent_links WHERE parent_chat_id=%s RETURNING student_id;",(parent_id,))
+            affected={r['student_id'] for r in cur.fetchall()}
+            for student_id in sorted(affected):
+                cur.execute("SELECT parent_chat_id FROM biology_students WHERE user_id=%s FOR UPDATE;",(student_id,))
+                student=cur.fetchone()
+                if student and student['parent_chat_id']==parent_id:
+                    cur.execute("SELECT parent_chat_id,parent_username,parent_full_name FROM biology_parent_links WHERE student_id=%s AND approved=TRUE ORDER BY linked_at,parent_chat_id LIMIT 1;",(student_id,))
+                    replacement=cur.fetchone()
+                    cur.execute("""UPDATE biology_students SET parent_chat_id=%s,parent_username=%s,
+                        parent_full_name=%s,parent_approved=%s WHERE user_id=%s;""",
+                        (replacement['parent_chat_id'] if replacement else None,
+                         replacement['parent_username'] if replacement else None,
+                         replacement['parent_full_name'] if replacement else None,
+                         bool(replacement),student_id))
+            cur.execute("DELETE FROM biology_communication_routes WHERE chat_id=%s AND role='parent';",(parent_id,))
+        conn.commit()

@@ -14,9 +14,9 @@ from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
 
-from telegram import BotCommand, InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, CopyTextButton, InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, NetworkError, TimedOut
 from telegram.ext import (
     AIORateLimiter, Application, ApplicationHandlerStop, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters,
@@ -99,7 +99,7 @@ _OWNER_ERROR_ALERT_AT=0.0
 
 REG_NAME, REG_SCHOOL, REG_GRADE, REG_JOIN = range(4)
 DIV = "━━━━━━━━━━━━━━━━━━"
-BUILD_VERSION = "v1.0-biology"
+BUILD_VERSION = "v1.2-parent-roles"
 NEON_ECO_MODE=_env_bool("NEON_ECO_MODE",True)
 NEON_ECO_INTERVAL_SECONDS=max(900,_env_int("NEON_ECO_INTERVAL_SECONDS",1800))
 NEON_BACKGROUND_INTERVAL_SECONDS=max(3600,_env_int("NEON_BACKGROUND_INTERVAL_SECONDS",21600))
@@ -205,6 +205,13 @@ def main_menu(admin=False):
     return InlineKeyboardMarkup(rows)
 
 
+def parent_copy_markup(code, with_back=False):
+    rows=[[InlineKeyboardButton('📋 نسخ /parent والرمز كاملاً',
+            copy_text=CopyTextButton(text=f'/parent {code}'),style='primary')]]
+    if with_back: rows.append([back_menu()])
+    return InlineKeyboardMarkup(rows)
+
+
 def parent_menu(students):
     rows=[]
     for s in students:
@@ -214,6 +221,7 @@ def parent_menu(students):
             [InlineKeyboardButton("🏅 إنجازات هذا الأسبوع",callback_data=f"parentachievements|{sid}"),InlineKeyboardButton("⚠️ الإنذارات",callback_data=f"parentwarnings|{sid}")],
             [InlineKeyboardButton("🏖 طلب إجازة للطالب",callback_data=f"parentleave|{sid}")],
         ])
+    rows.append([InlineKeyboardButton('🗑 حذف حساب ولي الأمر',callback_data='parent_delete',style='danger')])
     return InlineKeyboardMarkup(rows)
 
 
@@ -251,75 +259,77 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if is_admin(user.id):
         context.user_data.pop("registration",None)
-        await update.message.reply_text(bold("👑 مركز ادارة الأحياء\n━━━━━━━━━━━━━━━━━━\nالنشر • الامتحانات • المتابعة\n\nاختر القسم المطلوب من اللوحة المنظمة ادناه"),parse_mode=ParseMode.HTML,reply_markup=main_menu(True))
+        await update.effective_message.reply_text(bold("👑 مركز ادارة الأحياء\n━━━━━━━━━━━━━━━━━━\nالنشر • الامتحانات • المتابعة\n\nاختر القسم المطلوب من اللوحة المنظمة ادناه"),parse_mode=ParseMode.HTML,reply_markup=main_menu(True))
         return ConversationHandler.END
     existing=await get_student(user.id)
     if existing and existing["approved"] and int(existing.get("onboarding_version") or 0)<19:
         context.user_data.pop("registration",None)
         kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ البقاء على معلوماتي القديمة",callback_data="onboardkeep")],[InlineKeyboardButton("✏️ تغيير معلوماتي",callback_data="onboardedit")]])
-        await update.message.reply_text(bold(f"🆕 تحديث نظام الدراسة الجديد\n{DIV}\nبياناتك الحالية:\n👤 الاسم: {existing['full_name']}\n🏫 المدرسة: {existing['school']}\n🎯 المعدل المطلوب: {existing['target_grade']}\n\nهل تريد الاحتفاظ بهذه المعلومات أم تغييرها؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
+        await update.effective_message.reply_text(bold(f"🆕 تحديث نظام الدراسة الجديد\n{DIV}\nبياناتك الحالية:\n👤 الاسم: {existing['full_name']}\n🏫 المدرسة: {existing['school']}\n🎯 المعدل المطلوب: {existing['target_grade']}\n\nهل تريد الاحتفاظ بهذه المعلومات أم تغييرها؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
         return ConversationHandler.END
     parent_students=await students_by_parent(user.id,True)
-    if parent_students:
+    if parent_students and not existing:
         context.user_data.pop("registration",None)
-        await update.message.reply_text(bold("👪 واجهة ولي الأمر\n━━━━━━━━━━\nاختر ملف متابعة الطالب:"),parse_mode=ParseMode.HTML,reply_markup=parent_menu(parent_students))
+        await update.effective_message.reply_text(bold("👪 واجهة ولي الأمر\n━━━━━━━━━━\nاختر ملف متابعة الطالب:"),parse_mode=ParseMode.HTML,reply_markup=parent_menu(parent_students))
         return ConversationHandler.END
     pending_parent_students=await students_by_parent(user.id,False)
-    if pending_parent_students:
+    if pending_parent_students and not existing:
+        context.user_data.pop("registration",None)
         names="، ".join(s["full_name"] for s in pending_parent_students)
-        await update.message.reply_text(bold(f"⏳ طلب حساب ولي الأمر قيد المراجعة.\nالطالب: {names}\nستعمل الواجهة فور ضغط الإدارة زر «تفعيل الحساب»."),parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(bold(f"⏳ طلب حساب ولي الأمر قيد المراجعة.\nالطالب: {names}\nستعمل الواجهة فور ضغط الإدارة زر «تفعيل الحساب»."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 حذف حساب ولي الأمر",callback_data="parent_delete",style="danger")]]))
         return ConversationHandler.END
     if not await is_group_member(context.bot,user.id):
         kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ نعم، أرغب بالتسجيل",callback_data="guest_enroll")],[InlineKeyboardButton("📚 لا، فتح المكتبة العامة",callback_data="guest_continue")]])
-        await update.message.reply_text(bold("🧪 أهلاً بك في أكاديمية الأحياء\n━━━━━━━━━━━━━━━━━━\nتعلّم • اختبر نفسك • تابع تقدمك\n━━━━━━━━━━━━━━━━━━\n\nهل ترغب بالانضمام إلى دورة الأحياء المجانية؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
+        await update.effective_message.reply_text(bold("🧪 أهلاً بك في أكاديمية الأحياء\n━━━━━━━━━━━━━━━━━━\nتعلّم • اختبر نفسك • تابع تقدمك\n━━━━━━━━━━━━━━━━━━\n\nهل ترغب بالانضمام إلى دورة الأحياء المجانية؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
         return ConversationHandler.END
     if existing and existing["approved"]:
         context.user_data.pop("registration",None)
         if not existing.get("parent_chat_id"):
-            await update.message.reply_text(bold(f"🔒 تم إيقاف حسابك مؤقتاً\nيجب ربط ولي الأمر حتى تُفتح خدمات الدورة.\n\nرمز الربط: {existing['parent_link_code']}\nولي الأمر يفتح البوت وينسخ الأمر:")+f"\n<code>/parent {escape(existing['parent_link_code'])}</code>",parse_mode=ParseMode.HTML); return ConversationHandler.END
+            await update.effective_message.reply_text(bold(f"🔒 تم إيقاف حسابك مؤقتاً\nيجب ربط ولي الأمر حتى تُفتح خدمات الدورة.\n\nرمز الربط: {existing['parent_link_code']}\nولي الأمر يفتح البوت وينسخ الأمر:")+f"\n<code>/parent {escape(existing['parent_link_code'])}</code>",parse_mode=ParseMode.HTML,reply_markup=parent_copy_markup(existing["parent_link_code"])); return ConversationHandler.END
         if not await is_channel_member(context.bot,user.id):
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("📢 الاشتراك بقناة منصة المجتهد",url=REQUIRED_CHANNEL_URL)]])
-            await update.message.reply_text(bold("🔒 خدمات البوت مقفولة. يجب الاشتراك بقناة منصة المجتهد أولاً."),parse_mode=ParseMode.HTML,reply_markup=kb)
+            await update.effective_message.reply_text(bold("🔒 خدمات البوت مقفولة. يجب الاشتراك بقناة منصة المجتهد أولاً."),parse_mode=ParseMode.HTML,reply_markup=kb)
             return ConversationHandler.END
-        await update.message.reply_text(bold(f"⚡ بوت الأحياء | منصة المجتهد التعليمية\n━━━━━━━━━━━━━━━━━━\nأهلا {existing['full_name']} 👋\n\n🎯 ابدأ من مهامي اليومية حتى يعرض لك البوت أهم خطوة دراسية الآن"), parse_mode=ParseMode.HTML, reply_markup=main_menu())
+        await update.effective_message.reply_text(bold(f"⚡ بوت الأحياء | منصة المجتهد التعليمية\n━━━━━━━━━━━━━━━━━━\nأهلا {existing['full_name']} 👋\n\n🎯 ابدأ من مهامي اليومية حتى يعرض لك البوت أهم خطوة دراسية الآن"), parse_mode=ParseMode.HTML, reply_markup=main_menu())
         return ConversationHandler.END
     if existing and not existing["approved"]:
         if not existing.get("parent_chat_id"):
-            await update.message.reply_text(bold(f"👨‍👩‍👦 تسجيلك محفوظ، لكن يجب ربط ولي الأمر أولاً.\nرمز الربط: {existing['parent_link_code']}\nولي الأمر يفتح البوت وينسخ الأمر:")+f"\n<code>/parent {escape(existing['parent_link_code'])}</code>",parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(bold(f"👨‍👩‍👦 تسجيلك محفوظ، لكن يجب ربط ولي الأمر أولاً.\nرمز الربط: {existing['parent_link_code']}\nولي الأمر يفتح البوت وينسخ الأمر:")+f"\n<code>/parent {escape(existing['parent_link_code'])}</code>",parse_mode=ParseMode.HTML,reply_markup=parent_copy_markup(existing["parent_link_code"]))
         else:
-            await update.message.reply_text(bold("⏳ تم ربط ولي الأمر وطلب تفعيل حسابك قيد مراجعة الإدارة."),parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(bold("⏳ تم ربط ولي الأمر وطلب تفعيل حسابك قيد مراجعة الإدارة."),parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     context.user_data["registration"] = {}
-    await update.message.reply_text(bold("🧪 أهلاً بك في بوت مادة الأحياء\n\n✍️ أولاً: أرسل اسمك الرباعي:"), parse_mode=ParseMode.HTML)
+    context.user_data["registration_started_at"] = datetime.now(TIMEZONE)
+    await update.effective_message.reply_text(bold("🧪 أهلاً بك في بوت مادة الأحياء\n\n✍️ أولاً: أرسل اسمك الرباعي:"), parse_mode=ParseMode.HTML)
     return REG_NAME
 
 
 async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value=(update.message.text or "").strip()
     if len(value.split()) < 3 or len(value)>120:
-        await update.message.reply_text(bold("⚠️ أرسل اسمك الثلاثي أو الرباعي بصورة صحيحة."),parse_mode=ParseMode.HTML); return REG_NAME
+        await update.effective_message.reply_text(bold("⚠️ أرسل اسمك الثلاثي أو الرباعي بصورة صحيحة."),parse_mode=ParseMode.HTML); return REG_NAME
     context.user_data["registration"]["full_name"]=value
-    await update.message.reply_text(bold("🏫 ثانياً: أرسل اسم المدرسة:"),parse_mode=ParseMode.HTML); return REG_SCHOOL
+    await update.effective_message.reply_text(bold("🏫 ثانياً: أرسل اسم المدرسة:"),parse_mode=ParseMode.HTML); return REG_SCHOOL
 
 
 async def reg_school(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value=(update.message.text or "").strip()
-    if len(value)<2 or len(value)>160: await update.message.reply_text(bold("⚠️ أرسل اسم المدرسة بصورة صحيحة (160 حرفاً كحد أقصى)."),parse_mode=ParseMode.HTML); return REG_SCHOOL
+    if len(value)<2 or len(value)>160: await update.effective_message.reply_text(bold("⚠️ أرسل اسم المدرسة بصورة صحيحة (160 حرفاً كحد أقصى)."),parse_mode=ParseMode.HTML); return REG_SCHOOL
     context.user_data["registration"]["school"]=value
-    await update.message.reply_text(bold("🎯 ثالثاً: ما المعدل الذي تود الحصول عليه؟\nمثال: 95 أو 100"),parse_mode=ParseMode.HTML); return REG_GRADE
+    await update.effective_message.reply_text(bold("🎯 ثالثاً: ما المعدل الذي تود الحصول عليه؟\nمثال: 95 أو 100"),parse_mode=ParseMode.HTML); return REG_GRADE
 
 
 async def reg_grade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value=(update.message.text or "").strip()
     if not re.fullmatch(r"\d{1,3}(?:\.\d{1,2})?",value) or not 0<=float(value)<=100:
-        await update.message.reply_text(bold("⚠️ أرسل معدلاً رقمياً من 0 إلى 100."),parse_mode=ParseMode.HTML); return REG_GRADE
+        await update.effective_message.reply_text(bold("⚠️ أرسل معدلاً رقمياً من 0 إلى 100."),parse_mode=ParseMode.HTML); return REG_GRADE
     context.user_data["registration"]["target_grade"]=value
     kb=InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 الاشتراك بقناة منصة المجتهد",url=REQUIRED_CHANNEL_URL)],
         [InlineKeyboardButton("👥 الانضمام إلى كروب الأحياء",url=GROUP_INVITE_URL)],
         [InlineKeyboardButton("✅ تحقق وأرسل طلب التفعيل",callback_data="verify_join")],
     ])
-    await update.message.reply_text(bold("📌 رابعاً: اشترك بقناة منصة المجتهد وانضم إلى كروب الأحياء، ثم اضغط زر التحقق."),parse_mode=ParseMode.HTML,reply_markup=kb); return REG_JOIN
+    await update.effective_message.reply_text(bold("📌 رابعاً: اشترك بقناة منصة المجتهد وانضم إلى كروب الأحياء، ثم اضغط زر التحقق."),parse_mode=ParseMode.HTML,reply_markup=kb); return REG_JOIN
 
 
 async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,6 +341,9 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reg=context.user_data.get("registration",{})
     student=await register_student(update.effective_user.id,update.effective_user.username,reg["full_name"],reg["school"],reg["target_grade"])
     context.user_data.pop("registration",None)
+    if student.get('status')=='parent_account':
+        await query.edit_message_text('حسابك مربوط كولي أمر. لا يمكن تسجيل الحساب نفسه كطالب؛ احذف حساب ولي الأمر أولاً من واجهته.')
+        return ConversationHandler.END
     await query.edit_message_text(bold("✅ تم حفظ معلوماتك. بقي اختيار مسار الدراسة."),parse_mode=ParseMode.HTML,reply_markup=onboarding_track_keyboard())
     return ConversationHandler.END
 
@@ -598,11 +611,11 @@ async def receive_submission(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not task_id: return False
     student=await get_student(update.effective_user.id)
     if not student or not student["approved"] or not student.get("parent_chat_id") or not await is_channel_member(context.bot,update.effective_user.id):
-        context.user_data.pop("waiting_submission",None); await update.message.reply_text(bold("🔒 لا يمكنك التسليم: يجب تفعيل الحساب وربط ولي الأمر والاشتراك بالقناة."),parse_mode=ParseMode.HTML); return True
+        context.user_data.pop("waiting_submission",None); await update.effective_message.reply_text(bold("🔒 لا يمكنك التسليم: يجب تفعيل الحساب وربط ولي الأمر والاشتراك بالقناة."),parse_mode=ParseMode.HTML); return True
     task=await get_task(task_id)
     effective=await effective_task_deadline(task_id,update.effective_user.id) if task else None
     if not task or not effective or not effective.get("assigned") or (task["closed"] and datetime.now(TIMEZONE)>=effective["deadline"]) or datetime.now(TIMEZONE)>=effective["deadline"]:
-        context.user_data.pop("waiting_submission",None); await update.message.reply_text(bold("⏰ انتهى وقت التسليم."),parse_mode=ParseMode.HTML); return True
+        context.user_data.pop("waiting_submission",None); await update.effective_message.reply_text(bold("⏰ انتهى وقت التسليم."),parse_mode=ParseMode.HTML); return True
     msg=update.message; media=msg.document or (msg.photo[-1] if msg.photo else None) or msg.video
     if not media:
         await msg.reply_text(bold("⚠️ أرسل صورة أو ملف PDF أو فيديو كحل."),parse_mode=ParseMode.HTML); return True
@@ -763,22 +776,22 @@ async def receive_admin_communication(update: Update,context: ContextTypes.DEFAU
 async def direct_message_command(update: Update,context: ContextTypes.DEFAULT_TYPE,role):
     if not is_admin(update.effective_user.id): return
     if len(context.args)<2:
-        await update.message.reply_text(bold(f"الاستخدام: /{'msg_parent' if role=='parent' else 'msg_student'} ID نص الرسالة"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold(f"الاستخدام: /{'msg_parent' if role=='parent' else 'msg_student'} ID نص الرسالة"),parse_mode=ParseMode.HTML); return
     try: student_id=int(context.args[0])
     except ValueError: return
     student=await get_student(student_id)
     if not student:
-        await update.message.reply_text(bold("⚠️ الطالب غير موجود."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الطالب غير موجود."),parse_mode=ParseMode.HTML); return
     chat_id=student.get("parent_chat_id") if role=="parent" else student["user_id"]
     if not chat_id:
-        await update.message.reply_text(bold("⚠️ ولي الأمر غير مربوط."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ ولي الأمر غير مربوط."),parse_mode=ParseMode.HTML); return
     text_value=" ".join(context.args[1:])
     try:
         sent=await context.bot.send_message(chat_id,bold(f"💬 رسالة من إدارة دورة الأحياء\n\n{text_value}"),parse_mode=ParseMode.HTML)
         await save_communication_route(chat_id,sent.message_id,student_id,update.effective_chat.id,update.effective_message.message_thread_id or 0,role)
-        await update.message.reply_text(bold("✅ تم إرسال الرسالة، ويمكنه الرد عليها مباشرة."),parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(bold("✅ تم إرسال الرسالة، ويمكنه الرد عليها مباشرة."),parse_mode=ParseMode.HTML)
     except TelegramError:
-        await update.message.reply_text(bold("⚠️ تعذر الإرسال؛ يجب أن يكون الحساب قد فتح البوت سابقاً."),parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(bold("⚠️ تعذر الإرسال؛ يجب أن يكون الحساب قد فتح البوت سابقاً."),parse_mode=ParseMode.HTML)
 
 
 async def msg_student_command(update: Update,context: ContextTypes.DEFAULT_TYPE): await direct_message_command(update,context,"student")
@@ -822,16 +835,16 @@ async def receive_archive_media(update: Update,context: ContextTypes.DEFAULT_TYP
             lecture=int((update.message.text or "").strip())
             if lecture<1 or lecture>len(PLAYLISTS[meta["chapter"]]): raise ValueError
         except ValueError:
-            await update.message.reply_text(bold("⚠️ أرسل رقم محاضرة صحيحاً."),parse_mode=ParseMode.HTML); return True
+            await update.effective_message.reply_text(bold("⚠️ أرسل رقم محاضرة صحيحاً."),parse_mode=ParseMode.HTML); return True
         meta["lecture"]=lecture; meta["step"]="title"
-        await update.message.reply_text(bold("✍️ الآن أرسل اسم الامتحان."),parse_mode=ParseMode.HTML); return True
+        await update.effective_message.reply_text(bold("✍️ الآن أرسل اسم الامتحان."),parse_mode=ParseMode.HTML); return True
     if meta and meta.get("step")=="title":
         title=(update.message.text or "").strip()
         if not title:
-            await update.message.reply_text(bold("⚠️ أرسل اسم الامتحان أولاً."),parse_mode=ParseMode.HTML); return True
+            await update.effective_message.reply_text(bold("⚠️ أرسل اسم الامتحان أولاً."),parse_mode=ParseMode.HTML); return True
         archive=await create_archive_exam(meta["chapter"],title,update.effective_user.id,meta["lecture"])
         context.user_data.pop("archive_awaiting",None); context.user_data["waiting_archive_id"]=archive["id"]
-        await update.message.reply_text(bold("✅ تم تسجيل الاسم. أرسل الآن صور الامتحان أو ملف PDF، ثم اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML); return True
+        await update.effective_message.reply_text(bold("✅ تم تسجيل الاسم. أرسل الآن صور الامتحان أو ملف PDF، ثم اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML); return True
     archive_id=context.user_data.get("waiting_archive_id")
     if not archive_id: return False
     msg=update.message
@@ -924,18 +937,18 @@ async def receive_resource_input(update: Update,context: ContextTypes.DEFAULT_TY
     if meta:
         title=(update.message.text or "").strip()
         if not title:
-            await update.message.reply_text(bold("⚠️ أرسل اسم الملف أولاً."),parse_mode=ParseMode.HTML); return True
+            await update.effective_message.reply_text(bold("⚠️ أرسل اسم الملف أولاً."),parse_mode=ParseMode.HTML); return True
         resource=await create_resource(meta["category"],meta["chapter"],title,update.effective_user.id)
         context.user_data.pop("resource_awaiting_title",None); context.user_data["waiting_resource_id"]=resource["id"]
-        await update.message.reply_text(bold("✅ تم تسجيل الاسم. أرسل الآن الصور أو ملف PDF، وبعدها اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML); return True
+        await update.effective_message.reply_text(bold("✅ تم تسجيل الاسم. أرسل الآن الصور أو ملف PDF، وبعدها اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML); return True
     resource_id=context.user_data.get("waiting_resource_id")
     if not resource_id: return False
     payload_type,file_id,_=message_payload(update.message)
     if not file_id:
-        await update.message.reply_text(bold("⚠️ أرسل صورة أو ملف PDF."),parse_mode=ParseMode.HTML); return True
+        await update.effective_message.reply_text(bold("⚠️ أرسل صورة أو ملف PDF."),parse_mode=ParseMode.HTML); return True
     await add_resource_media(resource_id,payload_type,file_id)
     kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ إنهاء وحفظ",callback_data=f"finishresource|{resource_id}")]])
-    await update.message.reply_text(bold("✅ تمت إضافة الملف. أرسل ملفات أخرى أو اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML,reply_markup=kb); return True
+    await update.effective_message.reply_text(bold("✅ تمت إضافة الملف. أرسل ملفات أخرى أو اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML,reply_markup=kb); return True
 
 
 async def receive_private_reply(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -1255,7 +1268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("تم حفظ المسار")
         student_row=await get_student(uid); command=f"/parent {student_row['parent_link_code']}"
         parent_note="" if student_row.get("parent_chat_id") else f"\n\n👨‍👩‍👦 يجب ربط ولي أمر حقيقي من حساب Telegram مختلف. انسخ الأمر التالي وأرسله لولي أمرك، ثم يرسله هو للبوت:\n<code>{escape(command)}</code>"
-        await query.edit_message_text(bold(f"✅ اكتمل تحديث حسابك\n{summary}")+parent_note,parse_mode=ParseMode.HTML,reply_markup=main_menu() if student_row.get("parent_chat_id") and student_row.get("approved") else None)
+        await query.edit_message_text(bold(f"✅ اكتمل تحديث حسابك\n{summary}")+parent_note,parse_mode=ParseMode.HTML,reply_markup=main_menu() if student_row.get("parent_chat_id") and student_row.get("approved") else parent_copy_markup(student_row["parent_link_code"]))
         return
     if data.startswith("parentnotify|"):
         pending=context.user_data.pop("pending_parent_link",None)
@@ -1263,6 +1276,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notify=data.endswith("|yes")
         linked=await link_parent(pending["code"],uid,query.from_user.username,query.from_user.full_name,notify)
         if not linked: await query.answer("رمز الربط غير صحيح.",show_alert=True); return
+        if linked.get('status')=='student_account':
+            await query.answer('حسابك مسجل كطالب ولا يمكن ربطه كولي أمر.',show_alert=True)
+            await query.edit_message_text('🚫 تم رفض الربط: حساب الطالب لا يعمل كولي أمر لطالب آخر.')
+            return
         if linked.get("status")=="self_parent_forbidden":
             await query.answer("لا يمكن استعمال حساب الطالب نفسه كولي أمر.",show_alert=True)
             await query.edit_message_text(bold("🚫 رُفض الربط\nيجب فتح البوت من حساب Telegram مختلف يعود لولي الأمر الحقيقي، ثم إرسال أمر الربط من ذلك الحساب."),parse_mode=ParseMode.HTML); return
@@ -2160,7 +2177,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(bold("👑 حساب الإدارة لا يحتاج إلى ربط ولي أمر."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[back_menu()]])); return
         s=await get_student(uid)
         status="✅ تم ربط ولي الأمر" if s.get("parent_chat_id") else "⏳ لم يُربط ولي الأمر بعد"
-        await query.edit_message_text(bold(f"👨‍👩‍👦 ربط ولي الأمر\n\nرمزك الخاص: {s['parent_link_code']}\n\nأرسل هذا الأمر لولي أمرك حتى ينسخه ويرسله:")+f"\n<code>/parent {escape(s['parent_link_code'])}</code>\n"+bold(status),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[back_menu()]])); return
+        await query.edit_message_text(bold(f"👨‍👩‍👦 ربط ولي الأمر\n\nرمزك الخاص: {s['parent_link_code']}\n\nأرسل هذا الأمر لولي أمرك حتى ينسخه ويرسله:")+f"\n<code>/parent {escape(s['parent_link_code'])}</code>\n"+bold(status),parse_mode=ParseMode.HTML,reply_markup=parent_copy_markup(s["parent_link_code"],True)); return
     if data=="cumulative":
         exam=await get_cumulative_exam()
         text=bold("📭 لم يحدد الأستاذ موعد الامتحان التراكمي بعد.") if not exam else bold(f"🏆 الامتحان التراكمي\n\n📅 الموعد: {exam['exam_at'].astimezone(TIMEZONE).strftime('%d/%m/%Y %H:%M')}\n📚 المادة الداخلة: {exam['syllabus']}")
@@ -2173,31 +2190,31 @@ async def private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if refresh:
         value=(update.message.text or "").strip(); step=refresh["step"]
         if step=="full_name":
-            if len(value.split())<3: await update.message.reply_text(bold("⚠️ أرسل اسماً ثلاثياً أو رباعياً صحيحاً."),parse_mode=ParseMode.HTML); return
+            if len(value.split())<3: await update.effective_message.reply_text(bold("⚠️ أرسل اسماً ثلاثياً أو رباعياً صحيحاً."),parse_mode=ParseMode.HTML); return
             refresh["full_name"]=value; refresh["step"]="school"
-            await update.message.reply_text(bold("🏫 أرسل اسم المدرسة الجديد:"),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("🏫 أرسل اسم المدرسة الجديد:"),parse_mode=ParseMode.HTML); return
         if step=="school":
-            if len(value)<2: await update.message.reply_text(bold("⚠️ أرسل اسم مدرسة صحيحاً."),parse_mode=ParseMode.HTML); return
+            if len(value)<2: await update.effective_message.reply_text(bold("⚠️ أرسل اسم مدرسة صحيحاً."),parse_mode=ParseMode.HTML); return
             refresh["school"]=value; refresh["step"]="target_grade"
-            await update.message.reply_text(bold("🎯 أرسل المعدل الذي تريد الحصول عليه:"),parse_mode=ParseMode.HTML); return
-        if not value: await update.message.reply_text(bold("⚠️ أرسل المعدل المطلوب."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("🎯 أرسل المعدل الذي تريد الحصول عليه:"),parse_mode=ParseMode.HTML); return
+        if not value: await update.effective_message.reply_text(bold("⚠️ أرسل المعدل المطلوب."),parse_mode=ParseMode.HTML); return
         await update_student_profile(update.effective_user.id,"full_name",refresh["full_name"])
         await update_student_profile(update.effective_user.id,"school",refresh["school"])
         await update_student_profile(update.effective_user.id,"target_grade",value)
         context.user_data.pop("profile_refresh",None)
-        await update.message.reply_text(bold("✅ تم تحديث الاسم والمدرسة والمعدل المطلوب."),parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(bold("✅ تم تحديث الاسم والمدرسة والمعدل المطلوب."),parse_mode=ParseMode.HTML)
         await show_onboarding_track(update.message); return
     oath_state=context.user_data.get("awaiting_private_study_oath")
     if oath_state:
         received=(update.message.text or "").strip()
         if received!=PRIVATE_STUDY_OATH:
-            await update.message.reply_text(bold("⚠️ يجب إرسال القسم حرفياً بدون تغيير. اضغط على النص السابق لنسخه ثم أرسله في رسالة واحدة."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("⚠️ يجب إرسال القسم حرفياً بدون تغيير. اضغط على النص السابق لنسخه ثم أرسله في رسالة واحدة."),parse_mode=ParseMode.HTML); return
         context.user_data.pop("awaiting_private_study_oath",None)
         chapter,lecture=oath_state["chapter"],oath_state["lecture"]
         from_backlog=bool(oath_state.get("from_backlog"))
         progress=await lecture_progress(update.effective_user.id,chapter,lecture)
         if progress and progress.get("completed_at"):
-            await update.message.reply_text(bold("✅ تم تسجيل دراستك لهذه المحاضرة بنجاح مسبقاً."),parse_mode=ParseMode.HTML,reply_markup=main_menu()); return
+            await update.effective_message.reply_text(bold("✅ تم تسجيل دراستك لهذه المحاضرة بنجاح مسبقاً."),parse_mode=ParseMode.HTML,reply_markup=main_menu()); return
         await mark_lecture_progress(update.effective_user.id,chapter,lecture,True,"private_source_oath")
         await linked_exam_dispatch_job(context)
         backlog_done=await complete_backlog(update.effective_user.id,chapter,lecture)
@@ -2207,7 +2224,7 @@ async def private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([back_menu()])
         xp_text="\n⭐ حصلت على 15 XP لإكمال التحضير اليومي كاملاً." if prep_award and prep_award.get("awarded") else ""
         extra="\n\n🎉 مبروك! أنهيت محاضرة متراكمة. هل أنت جاهز لامتحانها؟" if backlog_done else ""
-        await update.message.reply_text(bold(f"✅ تم حفظ قسمك وتسجيل دراسة الفصل {chapter} – المحاضرة {lecture} من مصدرك الخاص.{xp_text}{extra}"),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+        await update.effective_message.reply_text(bold(f"✅ تم حفظ قسمك وتسجيل دراسة الفصل {chapter} – المحاضرة {lecture} من مصدرك الخاص.{xp_text}{extra}"),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
         student_row=await get_student(update.effective_user.id)
         for parent in await student_parents(update.effective_user.id,True):
             try: await context.bot.send_message(parent["parent_chat_id"],bold(f"🌟 إنجاز دراسي جديد\nأكمل الطالب {student_row['full_name']} محاضرة الأحياء رقم {lecture} من الفصل {chapter} من مصدره الدراسي الخاص بعد إرسال الإقرار."),parse_mode=ParseMode.HTML)
@@ -2218,14 +2235,14 @@ async def private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hours=int((update.message.text or "").strip())
             if not 1<=hours<=72: raise ValueError
         except ValueError:
-            await update.message.reply_text(bold("⚠️ أرسل رقماً من 1 إلى 72."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("⚠️ أرسل رقماً من 1 إلى 72."),parse_mode=ParseMode.HTML); return
         context.user_data.pop("awaiting_reopen_hours",None); row=await reopen_latest_daily_exam(hours)
-        if not row: await update.message.reply_text(bold("⚠️ لا يوجد امتحان يومي سابق."),parse_mode=ParseMode.HTML); return
+        if not row: await update.effective_message.reply_text(bold("⚠️ لا يوجد امتحان يومي سابق."),parse_mode=ParseMode.HTML); return
         deadline=row["deadline"].astimezone(TIMEZONE).strftime("%d/%m/%Y %H:%M")
         for s in await students_pending_task(row["id"]):
             try: await context.bot.send_message(s["user_id"],bold(f"🔓 تمت إعادة فتح الامتحان\n📝 {row['title']}\n⏳ متاح لمدة {hours} ساعة\n🕐 يغلق: {deadline}"),parse_mode=ParseMode.HTML)
             except TelegramError: pass
-        await update.message.reply_text(bold(f"✅ تمت إعادة فتح «{row['title']}» لمدة {hours} ساعة.\nينتهي: {deadline}\nتم إعلام الطلبة."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
+        await update.effective_message.reply_text(bold(f"✅ تمت إعادة فتح «{row['title']}» لمدة {hours} ساعة.\nينتهي: {deadline}\nتم إعلام الطلبة."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
     if await receive_linked_exam(update,context): return
     if await receive_manual_task(update,context): return
     if await receive_resource_input(update,context): return
@@ -2234,16 +2251,16 @@ async def private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await receive_private_reply(update,context): return
     if context.user_data.get("edit_field"):
         field=context.user_data.pop("edit_field"); value=(update.message.text or "").strip()
-        if not value: await update.message.reply_text(bold("⚠️ أرسل قيمة صحيحة."),parse_mode=ParseMode.HTML); return
+        if not value: await update.effective_message.reply_text(bold("⚠️ أرسل قيمة صحيحة."),parse_mode=ParseMode.HTML); return
         await update_student_profile(update.effective_user.id,field,value)
-        await update.message.reply_text(bold("✅ تم تعديل معلوماتك بنجاح."),parse_mode=ParseMode.HTML,reply_markup=main_menu()); return
+        await update.effective_message.reply_text(bold("✅ تم تعديل معلوماتك بنجاح."),parse_mode=ParseMode.HTML,reply_markup=main_menu()); return
     if context.user_data.get("awaiting_date"):
         mode=context.user_data.get("awaiting_date")
         try:
             target=datetime.strptime((update.message.text or "").strip(),"%d/%m/%Y").date()
             if target<datetime.now(TIMEZONE).date(): raise ValueError
         except ValueError:
-            await update.message.reply_text(bold("⚠️ التاريخ غير صحيح. أرسله مثل: 30/9/2026"),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("⚠️ التاريخ غير صحيح. أرسله مثل: 30/9/2026"),parse_mode=ParseMode.HTML); return
         context.user_data.pop("awaiting_date",None)
         if mode=="backlog":
             await set_backlog_deadline(update.effective_user.id,target)
@@ -2252,39 +2269,39 @@ async def private_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for row in rows:
                 item=PLAYLISTS[row["chapter"]][row["lecture"]-1]
                 lines.append(f"📅 {row['planned_date'].strftime('%d/%m')} | 🎬 الفصل {row['chapter']} – المحاضرة {row['lecture']}\n🔗 {item[2]}")
-            await update.message.reply_text(bold("\n\n".join(lines)),parse_mode=ParseMode.HTML,reply_markup=main_menu()); return
+            await update.effective_message.reply_text(bold("\n\n".join(lines)),parse_mode=ParseMode.HTML,reply_markup=main_menu()); return
         student=await get_student(update.effective_user.id)
         if not student or not (student.get("study_track")=="chapter" or student.get("schedule_mode")=="custom"):
-            await update.message.reply_text(bold("ℹ️ نظام الإجازات الأربع شهرياً متاح للطلاب على جدول شخصي أو مسار فصل مستقل."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("ℹ️ نظام الإجازات الأربع شهرياً متاح للطلاب على جدول شخصي أو مسار فصل مستقل."),parse_mode=ParseMode.HTML); return
         if await leave_month_usage(update.effective_user.id,target)>=4:
-            await update.message.reply_text(bold("⚠️ استنفدت 4 إجازات لهذا الشهر."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("⚠️ استنفدت 4 إجازات لهذا الشهر."),parse_mode=ParseMode.HTML); return
         result=await create_leave_request(update.effective_user.id,target)
-        if result["status"]=="track": await update.message.reply_text(bold("ℹ️ الإجازات الأربع شهرياً مخصصة لمسار الفصل فقط."),parse_mode=ParseMode.HTML); return
-        if result["status"]=="limit": await update.message.reply_text(bold("⚠️ استنفدت 4 إجازات لهذا الشهر."),parse_mode=ParseMode.HTML); return
-        if result["status"]=="xp": await update.message.reply_text(bold("⚠️ تحتاج 400 XP لطلب الإجازة."),parse_mode=ParseMode.HTML); return
-        if result["status"]!="ok": await update.message.reply_text(bold("⚠️ يوجد طلب لهذا اليوم مسبقاً."),parse_mode=ParseMode.HTML); return
+        if result["status"]=="track": await update.effective_message.reply_text(bold("ℹ️ الإجازات الأربع شهرياً مخصصة لمسار الفصل فقط."),parse_mode=ParseMode.HTML); return
+        if result["status"]=="limit": await update.effective_message.reply_text(bold("⚠️ استنفدت 4 إجازات لهذا الشهر."),parse_mode=ParseMode.HTML); return
+        if result["status"]=="xp": await update.effective_message.reply_text(bold("⚠️ تحتاج 400 XP لطلب الإجازة."),parse_mode=ParseMode.HTML); return
+        if result["status"]!="ok": await update.effective_message.reply_text(bold("⚠️ يوجد طلب لهذا اليوم مسبقاً."),parse_mode=ParseMode.HTML); return
         s=result["student"]; req=result["request"]
         kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ نعم",callback_data=f"leaveapprove|{req['id']}|{update.effective_user.id}"),InlineKeyboardButton("❌ لا",callback_data=f"leavedeny|{req['id']}|{update.effective_user.id}")]])
         try: await context.bot.send_message(s["parent_chat_id"],bold(f"🏖 طلب إجازة\nالطالب {s['full_name']} طلب إجازة من جميع مطلوبات يوم {target.strftime('%d/%m/%Y')}. الكلفة 400 XP. هل توافق؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
         except TelegramError: pass
-        await update.message.reply_text(bold("⏳ أرسل طلب الإجازة إلى ولي أمرك."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⏳ أرسل طلب الإجازة إلى ولي أمرك."),parse_mode=ParseMode.HTML); return
     if is_admin(update.effective_user.id):
-        await update.message.reply_text(bold("👑 استخدم أزرار لوحة الإدارة."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
+        await update.effective_message.reply_text(bold("👑 استخدم أزرار لوحة الإدارة."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
     student=await get_student(update.effective_user.id)
     if not student or not student["approved"]:
-        await update.message.reply_text(bold("⏳ حسابك غير مفعّل. أكمل التسجيل عبر /start وانتظر موافقة الإدارة."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⏳ حسابك غير مفعّل. أكمل التسجيل عبر /start وانتظر موافقة الإدارة."),parse_mode=ParseMode.HTML); return
     if not student.get("parent_chat_id"):
-        await update.message.reply_text(bold(f"🔒 خدمات الدورة متوقفة حتى ربط ولي الأمر.\nرمز الربط: {student['parent_link_code']}\nولي الأمر يفتح البوت وينسخ هذا الأمر ويرسله:")+f"\n<code>/parent {escape(student['parent_link_code'])}</code>",parse_mode=ParseMode.HTML); return
-    await update.message.reply_text(bold("استخدم أزرار القائمة الرئيسية للمتابعة."),parse_mode=ParseMode.HTML,reply_markup=main_menu())
+        await update.effective_message.reply_text(bold(f"🔒 خدمات الدورة متوقفة حتى ربط ولي الأمر.\nرمز الربط: {student['parent_link_code']}\nولي الأمر يفتح البوت وينسخ هذا الأمر ويرسله:")+f"\n<code>/parent {escape(student['parent_link_code'])}</code>",parse_mode=ParseMode.HTML,reply_markup=parent_copy_markup(student["parent_link_code"])); return
+    await update.effective_message.reply_text(bold("استخدم أزرار القائمة الرئيسية للمتابعة."),parse_mode=ParseMode.HTML,reply_markup=main_menu())
 
 
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    if len(context.args)<2: await update.message.reply_text(bold("الاستخدام: /warn ID السبب"),parse_mode=ParseMode.HTML); return
+    if len(context.args)<2: await update.effective_message.reply_text(bold("الاستخدام: /warn ID السبب"),parse_mode=ParseMode.HTML); return
     try: uid=int(context.args[0])
     except ValueError: return
     reason=" ".join(context.args[1:]); count=await add_warning(uid,reason,update.effective_user.id)
-    await update.message.reply_text(bold(f"✅ أصبح لدى الطالب {count}/{MAX_WARNINGS} إنذارات."),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ أصبح لدى الطالب {count}/{MAX_WARNINGS} إنذارات."),parse_mode=ParseMode.HTML)
     student=await get_student(uid)
     if student: await notify_student_and_parent(context.bot,student,f"⚠️ إنذار إداري ({count}/{MAX_WARNINGS})\nالسبب: {reason}")
     if count>=MAX_WARNINGS and BIOLOGY_GROUP_ID:
@@ -2297,10 +2314,10 @@ async def unwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: uid=int(context.args[0])
     except ValueError: return
     try: warning_id=int(context.args[1]) if len(context.args)>1 else None
-    except ValueError: await update.message.reply_text(bold("⚠️ رقم الإنذار غير صحيح."),parse_mode=ParseMode.HTML); return
+    except ValueError: await update.effective_message.reply_text(bold("⚠️ رقم الإنذار غير صحيح."),parse_mode=ParseMode.HTML); return
     count=await remove_warning(uid,update.effective_user.id,warning_id)
-    if count is None: await update.message.reply_text(bold("⚠️ الإنذار غير موجود أو ليس تابعاً لهذا الطالب."),parse_mode=ParseMode.HTML); return
-    await update.message.reply_text(bold(f"✅ تم حذف الإنذار. المتبقي: {count}/{MAX_WARNINGS}"),parse_mode=ParseMode.HTML)
+    if count is None: await update.effective_message.reply_text(bold("⚠️ الإنذار غير موجود أو ليس تابعاً لهذا الطالب."),parse_mode=ParseMode.HTML); return
+    await update.effective_message.reply_text(bold(f"✅ تم حذف الإنذار. المتبقي: {count}/{MAX_WARNINGS}"),parse_mode=ParseMode.HTML)
 
 
 async def warnings_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -2308,12 +2325,12 @@ async def warnings_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     try: student_id=int(context.args[0])
     except ValueError: return
     student=await get_student(student_id); rows=await student_warning_history(student_id)
-    if not student: await update.message.reply_text(bold("⚠️ الطالب غير موجود."),parse_mode=ParseMode.HTML); return
+    if not student: await update.effective_message.reply_text(bold("⚠️ الطالب غير موجود."),parse_mode=ParseMode.HTML); return
     lines=[f"⚠️ إنذارات {student['full_name']}",f"المجموع: {student['warnings']}",DIV]
     for row in rows: lines.append(f"🆔 الإنذار: {row['id']}\nالسبب: {row['reason']}\nالوقت: {row['created_at'].astimezone(TIMEZONE).strftime('%d/%m/%Y %H:%M')}")
     if not rows: lines.append("لا توجد إنذارات.")
     lines.append(f"\nللحذف: /unwarn {student_id} WARNING_ID")
-    await update.message.reply_text(bold("\n\n".join(lines)),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold("\n\n".join(lines)),parse_mode=ParseMode.HTML)
 
 
 async def audit_exam_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -2325,7 +2342,7 @@ async def audit_exam_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     else:
         task=await latest_daily_exam()
     if not task or task["kind"]!="exam":
-        await update.message.reply_text(bold("⚠️ الامتحان غير موجود. استخدم: /audit_exam TASK_ID"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الامتحان غير موجود. استخدم: /audit_exam TASK_ID"),parse_mode=ParseMode.HTML); return
     audit=await task_warning_audit(task["id"])
     now=datetime.now(TIMEZONE); submitted=[]; warned=[]; waiting=[]; missing=[]
     for row in audit["students"]:
@@ -2339,7 +2356,7 @@ async def audit_exam_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if missing: lines.append("\nالطلبة الناقص إنذارهم:\n"+"\n".join(f"• {x['full_name']} | {x['user_id']}" for x in missing))
     if waiting: lines.append("\nبانتظار انتهاء التمديد:\n"+"\n".join(f"• {x['full_name']} | إلى {x['extended_until'].astimezone(TIMEZONE).strftime('%d/%m %H:%M')}" for x in waiting))
     lines.append(f"\nللإصلاح الفوري: /repair_exam_warnings {task['id']}")
-    await update.message.reply_text(bold("\n".join(lines)),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold("\n".join(lines)),parse_mode=ParseMode.HTML)
 
 
 async def repair_exam_warnings_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -2350,11 +2367,11 @@ async def repair_exam_warnings_command(update: Update,context: ContextTypes.DEFA
         except ValueError: pass
     else: task=await latest_daily_exam()
     if not task or task["kind"]!="exam":
-        await update.message.reply_text(bold("⚠️ الامتحان غير موجود."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الامتحان غير موجود."),parse_mode=ParseMode.HTML); return
     if task["deadline"]>datetime.now(TIMEZONE):
-        await update.message.reply_text(bold("⚠️ الامتحان لم يصل إلى موعد انتهائه الأصلي بعد."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الامتحان لم يصل إلى موعد انتهائه الأصلي بعد."),parse_mode=ParseMode.HTML); return
     warned,removed=await issue_missing_task_warnings(context,task)
-    await update.message.reply_text(bold(f"✅ اكتمل فحص الامتحان #{task['id']}.\nالإنذارات الجديدة: {warned}\nالحظر بعد بلوغ الحد: {removed}\nأصحاب التمديد الفعال سيُفحصون تلقائياً بعد انتهائه."),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ اكتمل فحص الامتحان #{task['id']}.\nالإنذارات الجديدة: {warned}\nالحظر بعد بلوغ الحد: {removed}\nأصحاب التمديد الفعال سيُفحصون تلقائياً بعد انتهائه."),parse_mode=ParseMode.HTML)
 
 
 async def ban_student_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -2363,8 +2380,8 @@ async def ban_student_command(update: Update,context: ContextTypes.DEFAULT_TYPE)
     except ValueError: return
     try:
         await context.bot.ban_chat_member(BIOLOGY_GROUP_ID,student_id)
-        await update.message.reply_text(bold("✅ تم حظر الطالب يدوياً من الدورة."),parse_mode=ParseMode.HTML)
-    except TelegramError as exc: await update.message.reply_text(bold(f"⚠️ تعذر الحظر: {exc}"),parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(bold("✅ تم حظر الطالب يدوياً من الدورة."),parse_mode=ParseMode.HTML)
+    except TelegramError as exc: await update.effective_message.reply_text(bold(f"⚠️ تعذر الحظر: {exc}"),parse_mode=ParseMode.HTML)
 
 
 async def xp_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -2373,49 +2390,53 @@ async def xp_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     except ValueError: return
     reason=" ".join(context.args[2:]) or "تعديل إداري"
     student,change=await adjust_xp(student_id,delta,reason,update.effective_user.id)
-    if not student: await update.message.reply_text(bold("⚠️ الطالب غير موجود."),parse_mode=ParseMode.HTML); return
-    await update.message.reply_text(bold(f"✅ تم تعديل XP بمقدار {change:+d}. الرصيد الحالي: {student['xp']} XP"),parse_mode=ParseMode.HTML)
+    if not student: await update.effective_message.reply_text(bold("⚠️ الطالب غير موجود."),parse_mode=ParseMode.HTML); return
+    await update.effective_message.reply_text(bold(f"✅ تم تعديل XP بمقدار {change:+d}. الرصيد الحالي: {student['xp']} XP"),parse_mode=ParseMode.HTML)
 
 
 async def prep_swap_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    ok=await swap_next_preparations(); await update.message.reply_text(bold("✅ تم تبديل التحضيرين القادمين." if ok else "⚠️ لا يوجد تحضيران قادمان."),parse_mode=ParseMode.HTML)
+    ok=await swap_next_preparations(); await update.effective_message.reply_text(bold("✅ تم تبديل التحضيرين القادمين." if ok else "⚠️ لا يوجد تحضيران قادمان."),parse_mode=ParseMode.HTML)
 
 
 async def prep_add_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or len(context.args)!=3:
-        if is_admin(update.effective_user.id): await update.message.reply_text(bold("الاستخدام: /prep_add 30/8/2026 3 10,11"),parse_mode=ParseMode.HTML)
+        if is_admin(update.effective_user.id): await update.effective_message.reply_text(bold("الاستخدام: /prep_add 30/8/2026 3 10,11"),parse_mode=ParseMode.HTML)
         return
     try:
         target=datetime.strptime(context.args[0],"%d/%m/%Y").date(); chapter=int(context.args[1]); lectures=context.args[2]
         lecture_numbers=sorted({int(x) for x in lectures.split(",")})
         if chapter not in PLAYLISTS or not lecture_numbers or any(n<1 or n>len(PLAYLISTS[chapter]) for n in lecture_numbers): raise ValueError
         lectures=",".join(map(str,lecture_numbers))
-    except ValueError: await update.message.reply_text(bold("⚠️ البيانات غير صحيحة."),parse_mode=ParseMode.HTML); return
-    row=await add_extra_preparation(target,chapter,lectures); await update.message.reply_text(bold(f"✅ أضيف تحضير يومي إضافي بتاريخ {row['target_date'].strftime('%d/%m/%Y')}."),parse_mode=ParseMode.HTML)
+    except ValueError: await update.effective_message.reply_text(bold("⚠️ البيانات غير صحيحة."),parse_mode=ParseMode.HTML); return
+    row=await add_extra_preparation(target,chapter,lectures); await update.effective_message.reply_text(bold(f"✅ أضيف تحضير يومي إضافي بتاريخ {row['target_date'].strftime('%d/%m/%Y')}."),parse_mode=ParseMode.HTML)
 
 
 async def set_cumulative_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    if len(context.args)<3: await update.message.reply_text(bold("الاستخدام: /set_cumulative 30/8/2026 20:00 الفصل الثالث محاضرات 1-10"),parse_mode=ParseMode.HTML); return
+    if len(context.args)<3: await update.effective_message.reply_text(bold("الاستخدام: /set_cumulative 30/8/2026 20:00 الفصل الثالث محاضرات 1-10"),parse_mode=ParseMode.HTML); return
     try:
         exam_at=datetime.strptime(f"{context.args[0]} {context.args[1]}","%d/%m/%Y %H:%M").replace(tzinfo=TIMEZONE)
-    except ValueError: await update.message.reply_text(bold("⚠️ صيغة التاريخ غير صحيحة."),parse_mode=ParseMode.HTML); return
+    except ValueError: await update.effective_message.reply_text(bold("⚠️ صيغة التاريخ غير صحيحة."),parse_mode=ParseMode.HTML); return
     syllabus=" ".join(context.args[2:]); await set_cumulative_exam(exam_at,syllabus,update.effective_user.id)
-    await update.message.reply_text(bold("✅ تم تحديث موعد ومادة الامتحان التراكمي."),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold("✅ تم تحديث موعد ومادة الامتحان التراكمي."),parse_mode=ParseMode.HTML)
 
 
 async def parent_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if len(context.args)!=1:
-        await update.message.reply_text(bold("أرسل رمز الطالب بهذه الصيغة:\n/parent ABCD1234"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("أرسل رمز الطالب بهذه الصيغة:\n/parent ABCD1234"),parse_mode=ParseMode.HTML); return
+    context.user_data.pop('registration',None)
+    if await get_student(update.effective_user.id):
+        await update.effective_message.reply_text('🚫 حسابك مسجل كطالب. ما تكدر تربطه كولي أمر لطالب آخر.')
+        return ConversationHandler.END
     code=context.args[0].strip(); student=await get_student_by_parent_code(code)
     if not student:
-        await update.message.reply_text(bold("⚠️ رمز الربط غير صحيح."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ رمز الربط غير صحيح."),parse_mode=ParseMode.HTML); return
     if student["user_id"]==update.effective_user.id:
-        await update.message.reply_text(bold("🚫 لا يمكن ربط حساب الطالب نفسه كولي أمر.\nأرسل الأمر إلى حساب Telegram مختلف يعود لولي أمرك، وليقم هو بإرساله إلى البوت."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("🚫 لا يمكن ربط حساب الطالب نفسه كولي أمر.\nأرسل الأمر إلى حساب Telegram مختلف يعود لولي أمرك، وليقم هو بإرساله إلى البوت."),parse_mode=ParseMode.HTML); return
     context.user_data["pending_parent_link"]={"code":code}
     kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ نعم، أخبر الطالب",callback_data="parentnotify|yes")],[InlineKeyboardButton("🔕 لا، لا تخبره",callback_data="parentnotify|no")]])
-    await update.message.reply_text(bold(f"👪 سيتم ربطك بالطالب: {student['full_name']}\nهل تريد إعلام الطالب بتسجيلك كولي أمر؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
+    await update.effective_message.reply_text(bold(f"👪 سيتم ربطك بالطالب: {student['full_name']}\nهل تريد إعلام الطالب بتسجيلك كولي أمر؟"),parse_mode=ParseMode.HTML,reply_markup=kb)
 
 
 async def approve_parent_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -2426,9 +2447,9 @@ async def approve_parent_command(update: Update,context: ContextTypes.DEFAULT_TY
     except ValueError: return
     student=await approve_parent(student_id,True,parent_id)
     if not student:
-        await update.message.reply_text(bold("⚠️ لا يوجد ولي أمر مربوط بهذا الطالب."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ لا يوجد ولي أمر مربوط بهذا الطالب."),parse_mode=ParseMode.HTML); return
     parent_id=student["approved_parent_chat_id"]
-    await update.message.reply_text(bold(f"✅ تم تفعيل ولي أمر الطالب {student['full_name']}\nالحساب: @{student.get('approved_parent_username') or '-'}\nالمعرف: {parent_id}"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ تم تفعيل ولي أمر الطالب {student['full_name']}\nالحساب: @{student.get('approved_parent_username') or '-'}\nالمعرف: {parent_id}"),parse_mode=ParseMode.HTML)
     try: await context.bot.send_message(parent_id,bold(f"✅ فعّلت الإدارة حسابك كولي أمر للطالب {student['full_name']}.\nأرسل /start لفتح واجهة ولي الأمر."),parse_mode=ParseMode.HTML)
     except TelegramError: pass
 
@@ -2436,20 +2457,20 @@ async def approve_parent_command(update: Update,context: ContextTypes.DEFAULT_TY
 async def grade_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if not update.message.reply_to_message or len(context.args)!=1:
-        await update.message.reply_text(bold("رد على رسالة حل الطالب واكتب مثلاً: /grade 85"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("رد على رسالة حل الطالب واكتب مثلاً: /grade 85"),parse_mode=ParseMode.HTML); return
     try:
         grade=int(context.args[0])
         if not 0<=grade<=100: raise ValueError
     except ValueError:
-        await update.message.reply_text(bold("⚠️ الدرجة يجب أن تكون من 0 إلى 100."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الدرجة يجب أن تكون من 0 إلى 100."),parse_mode=ParseMode.HTML); return
     reference=await submission_by_review(update.effective_chat.id,update.message.reply_to_message.message_id)
     if reference and reference["kind"]=="homework":
-        await update.message.reply_text(bold("📚 الواجبات لا تُعطى لها درجات؛ البوت يسجل التسليم بعلامة ✅ فقط."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("📚 الواجبات لا تُعطى لها درجات؛ البوت يسجل التسليم بعلامة ✅ فقط."),parse_mode=ParseMode.HTML); return
     row=await grade_submission_by_review(update.effective_chat.id,update.message.reply_to_message.message_id,grade,update.effective_user.id)
     if not row:
-        await update.message.reply_text(bold("⚠️ يجب الرد على رسالة حل أرسلها البوت داخل مجموعة الواجبات أو الامتحانات."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ يجب الرد على رسالة حل أرسلها البوت داخل مجموعة الواجبات أو الامتحانات."),parse_mode=ParseMode.HTML); return
     noun="الواجب" if row["kind"]=="homework" else "الامتحان"
-    await update.message.reply_text(bold(f"✅ تم تسجيل درجة {row['full_name']}: {grade}/100"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ تم تسجيل درجة {row['full_name']}: {grade}/100"),parse_mode=ParseMode.HTML)
     await notify_student_and_parent(context.bot,row,f"📊 درجة {noun}\n👤 الطالب: {row['full_name']}\n📌 {row['title']}\n✅ الدرجة: {grade}/100")
     if row["kind"]=="exam" and grade<60:
         count=await add_warning(row["user_id"],f"رسوب في {row['title']} بدرجة {grade}",update.effective_user.id,reference["task_id"])
@@ -2460,128 +2481,128 @@ async def grade_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
 async def add_previous_exam_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if update.effective_chat.type!="private":
-        await update.message.reply_text(bold("⚠️ أرسل هذا الأمر في المحادثة الخاصة مع البوت حتى ترفع ملفات الامتحان بأمان."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ أرسل هذا الأمر في المحادثة الخاصة مع البوت حتى ترفع ملفات الامتحان بأمان."),parse_mode=ParseMode.HTML); return
     if len(context.args)<2:
-        await update.message.reply_text(bold("الاستخدام القديم ما زال يعمل:\n/add_previous_exam رقم_الفصل اسم الامتحان\n\nوالترتيب الجديد حسب المحاضرة:\n/add_previous_exam رقم_الفصل رقم_المحاضرة اسم الامتحان"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام القديم ما زال يعمل:\n/add_previous_exam رقم_الفصل اسم الامتحان\n\nوالترتيب الجديد حسب المحاضرة:\n/add_previous_exam رقم_الفصل رقم_المحاضرة اسم الامتحان"),parse_mode=ParseMode.HTML); return
     try:
         chapter=int(context.args[0])
         if not 1<=chapter<=5: raise ValueError
     except ValueError:
-        await update.message.reply_text(bold("⚠️ رقم الفصل يجب أن يكون من 1 إلى 9."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ رقم الفصل يجب أن يكون من 1 إلى 9."),parse_mode=ParseMode.HTML); return
     lecture=None
     if len(context.args)>=3 and context.args[1].isdigit():
         lecture=int(context.args[1])
         if not 1<=lecture<=len(PLAYLISTS[chapter]):
-            await update.message.reply_text(bold("⚠️ رقم المحاضرة غير صحيح."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("⚠️ رقم المحاضرة غير صحيح."),parse_mode=ParseMode.HTML); return
         title=" ".join(context.args[2:]).strip()
     else: title=" ".join(context.args[1:]).strip()
     archive=await create_archive_exam(chapter,title,update.effective_user.id,lecture)
     context.user_data["waiting_archive_id"]=archive["id"]
-    await update.message.reply_text(bold(f"🗂 تم إنشاء «{title}» في الفصل {chapter}.\nأرسل الآن الصور أو ملف PDF، ثم اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"🗂 تم إنشاء «{title}» في الفصل {chapter}.\nأرسل الآن الصور أو ملف PDF، ثم اضغط إنهاء وحفظ."),parse_mode=ParseMode.HTML)
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
-        await update.message.reply_text(bold("👑 مركز ادارة الأحياء\n━━━━━━━━━━━━━━━━━━\nاختر القسم الذي تريد ادارته"),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
+        await update.effective_message.reply_text(bold("👑 مركز ادارة الأحياء\n━━━━━━━━━━━━━━━━━━\nاختر القسم الذي تريد ادارته"),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
     student=await get_student(update.effective_user.id)
     if not student or not student["approved"]: await start(update,context); return
     if not student.get("parent_chat_id"):
-        await update.message.reply_text(bold(f"🔒 يجب ربط ولي الأمر أولاً.\nرمزك: {student['parent_link_code']}\nولي الأمر ينسخ ويرسل:")+f"\n<code>/parent {escape(student['parent_link_code'])}</code>",parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold(f"🔒 يجب ربط ولي الأمر أولاً.\nرمزك: {student['parent_link_code']}\nولي الأمر ينسخ ويرسل:")+f"\n<code>/parent {escape(student['parent_link_code'])}</code>",parse_mode=ParseMode.HTML,reply_markup=parent_copy_markup(student["parent_link_code"])); return
     if not await is_channel_member(context.bot,update.effective_user.id):
-        await update.message.reply_text(bold("🔒 يجب الاشتراك بقناة منصة المجتهد أولاً."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 الاشتراك بالقناة",url=REQUIRED_CHANNEL_URL)]])); return
-    await update.message.reply_text(bold(f"⚡ بوت الأحياء | منصة المجتهد التعليمية\n━━━━━━━━━━━━━━━━━━\nأهلا {student['full_name']} 👋\n🎯 مهامي اليومية تختار لك الخطوة الأهم تلقائيا"),parse_mode=ParseMode.HTML,reply_markup=main_menu())
+        await update.effective_message.reply_text(bold("🔒 يجب الاشتراك بقناة منصة المجتهد أولاً."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 الاشتراك بالقناة",url=REQUIRED_CHANNEL_URL)]])); return
+    await update.effective_message.reply_text(bold(f"⚡ بوت الأحياء | منصة المجتهد التعليمية\n━━━━━━━━━━━━━━━━━━\nأهلا {student['full_name']} 👋\n🎯 مهامي اليومية تختار لك الخطوة الأهم تلقائيا"),parse_mode=ParseMode.HTML,reply_markup=main_menu())
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(bold(f"👤 معرفك: {update.effective_user.id}\n💬 معرف المحادثة: {update.effective_chat.id}\n📂 معرف الموضوع: {update.effective_message.message_thread_id or 0}"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"👤 معرفك: {update.effective_user.id}\n💬 معرف المحادثة: {update.effective_chat.id}\n📂 معرف الموضوع: {update.effective_message.message_thread_id or 0}"),parse_mode=ParseMode.HTML)
 
 
 async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if len(context.args)!=3:
-        await update.message.reply_text(bold("الاستخدام: /deadline رقم_المنشور 26/8/2026 23:00"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام: /deadline رقم_المنشور 26/8/2026 23:00"),parse_mode=ParseMode.HTML); return
     try:
         pending_id=int(context.args[0])
         deadline=datetime.strptime(f"{context.args[1]} {context.args[2]}","%d/%m/%Y %H:%M").replace(tzinfo=TIMEZONE)
         if deadline<=datetime.now(TIMEZONE): raise ValueError
     except ValueError:
-        await update.message.reply_text(bold("⚠️ الرقم أو التاريخ غير صحيح، أو أن الموعد قد مضى."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الرقم أو التاريخ غير صحيح، أو أن الموعد قد مضى."),parse_mode=ParseMode.HTML); return
     task=await confirm_pending_task(pending_id,deadline)
     if not task:
-        await update.message.reply_text(bold("⚠️ المنشور غير موجود أو تم ربطه مسبقاً."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ المنشور غير موجود أو تم ربطه مسبقاً."),parse_mode=ParseMode.HTML); return
     await notify_task_assignment(context.bot,task)
-    await update.message.reply_text(bold(f"✅ تم الربط بنجاح.\n🆔 رقم المهمة: {task['id']}\n⏰ انتهاء التسليم: {deadline.strftime('%d/%m/%Y %H:%M')}"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ تم الربط بنجاح.\n🆔 رقم المهمة: {task['id']}\n⏰ انتهاء التسليم: {deadline.strftime('%d/%m/%Y %H:%M')}"),parse_mode=ParseMode.HTML)
 
 
 async def prep_date_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if len(context.args)!=1:
-        await update.message.reply_text(bold("الاستخدام: /prep_date 30/8/2026"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام: /prep_date 30/8/2026"),parse_mode=ParseMode.HTML); return
     try:
         target=datetime.strptime(context.args[0],"%d/%m/%Y").date()
         if target<=datetime.now(TIMEZONE).date(): raise ValueError
         row=await reschedule_unpublished_preparations(target)
     except ValueError:
-        await update.message.reply_text(bold("⚠️ التاريخ غير صحيح أو ليس بعد تاريخ اليوم."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ التاريخ غير صحيح أو ليس بعد تاريخ اليوم."),parse_mode=ParseMode.HTML); return
     except Exception:
-        await update.message.reply_text(bold("⚠️ تعذر اعتماد التاريخ لأنه يتعارض مع تحضير منشور سابق."),parse_mode=ParseMode.HTML); return
-    if not row: await update.message.reply_text(bold("لا توجد تحاضير قادمة."),parse_mode=ParseMode.HTML); return
-    await update.message.reply_text(bold(f"✅ تم تحديد موعد التحضير القادم في {target.strftime('%d/%m/%Y')} وإعادة ترتيب جميع التحاضير التالية تلقائياً."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True))
+        await update.effective_message.reply_text(bold("⚠️ تعذر اعتماد التاريخ لأنه يتعارض مع تحضير منشور سابق."),parse_mode=ParseMode.HTML); return
+    if not row: await update.effective_message.reply_text(bold("لا توجد تحاضير قادمة."),parse_mode=ParseMode.HTML); return
+    await update.effective_message.reply_text(bold(f"✅ تم تحديد موعد التحضير القادم في {target.strftime('%d/%m/%Y')} وإعادة ترتيب جميع التحاضير التالية تلقائياً."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True))
 
 
 async def chapter_end_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if len(context.args)<2:
-        await update.message.reply_text(bold("الاستخدام: /chapter_end 3 30/9/2026\nللفصول من 1 إلى 5."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام: /chapter_end 3 30/9/2026\nللفصول من 1 إلى 5."),parse_mode=ParseMode.HTML); return
     try:
         chapter=int(context.args[0])
         if not 1<=chapter<=5: raise ValueError
         target=datetime.strptime(context.args[1],"%d/%m/%Y").date()
     except ValueError:
-        await update.message.reply_text(bold("⚠️ أرسل رقم فصل من 1 إلى 9 وتاريخاً بالصيغة 30/9/2026."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ أرسل رقم فصل من 1 إلى 9 وتاريخاً بالصيغة 30/9/2026."),parse_mode=ParseMode.HTML); return
     value=target.strftime("%d/%m/%Y")
     await set_setting_value(f"chapter_{chapter}_completion",value)
-    await update.message.reply_text(bold(f"✅ تم تحديد موعد إكمال الفصل {chapter}: {value}"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ تم تحديد موعد إكمال الفصل {chapter}: {value}"),parse_mode=ParseMode.HTML)
 
 
 async def reopen_exam_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if len(context.args)!=1:
-        await update.message.reply_text(bold("الاستخدام: /reopen_exam 3\nالرقم هو عدد ساعات إعادة فتح آخر امتحان يومي."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام: /reopen_exam 3\nالرقم هو عدد ساعات إعادة فتح آخر امتحان يومي."),parse_mode=ParseMode.HTML); return
     try:
         hours=int(context.args[0])
         if not 1<=hours<=72: raise ValueError
     except ValueError:
-        await update.message.reply_text(bold("⚠️ عدد الساعات يجب أن يكون من 1 إلى 72."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ عدد الساعات يجب أن يكون من 1 إلى 72."),parse_mode=ParseMode.HTML); return
     row=await reopen_latest_daily_exam(hours)
     if not row:
-        await update.message.reply_text(bold("⚠️ لا يوجد امتحان يومي سابق."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ لا يوجد امتحان يومي سابق."),parse_mode=ParseMode.HTML); return
     deadline=row["deadline"].astimezone(TIMEZONE).strftime("%d/%m/%Y %H:%M")
     for s in await students_pending_task(row["id"]):
         try: await context.bot.send_message(s["user_id"],bold(f"🔓 تمت إعادة فتح الامتحان\n📝 {row['title']}\n⏳ متاح لمدة {hours} ساعة\n🕐 يغلق: {deadline}"),parse_mode=ParseMode.HTML)
         except TelegramError: pass
-    await update.message.reply_text(bold(f"✅ تمت إعادة فتح «{row['title']}» لمدة {hours} ساعة.\nينتهي: {deadline}\nتم إعلام الطلبة."),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ تمت إعادة فتح «{row['title']}» لمدة {hours} ساعة.\nينتهي: {deadline}\nتم إعلام الطلبة."),parse_mode=ParseMode.HTML)
 
 
 async def publish_at_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     state=context.user_data.get("manual_task")
     if not state or state.get("step")!="publish_time":
-        await update.message.reply_text(bold("⚠️ اختر أولاً «نشر واجب أو امتحان»، ثم أرسل الاسم والملف واختر جدولة النشر."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ اختر أولاً «نشر واجب أو امتحان»، ثم أرسل الاسم والملف واختر جدولة النشر."),parse_mode=ParseMode.HTML); return
     if len(context.args)!=3:
-        await update.message.reply_text(bold("الاستخدام: /publish_at 30/8/2026 18:00 24\nالرقم الأخير هو عدد ساعات التسليم بعد النشر."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام: /publish_at 30/8/2026 18:00 24\nالرقم الأخير هو عدد ساعات التسليم بعد النشر."),parse_mode=ParseMode.HTML); return
     try:
         publish_at=datetime.strptime(f"{context.args[0]} {context.args[1]}","%d/%m/%Y %H:%M").replace(tzinfo=TIMEZONE)
         hours=int(context.args[2])
         if publish_at<=datetime.now(TIMEZONE) or not 1<=hours<=720: raise ValueError
     except ValueError:
-        await update.message.reply_text(bold("⚠️ الموعد يجب أن يكون في المستقبل، ومدة التسليم بين ساعة و720 ساعة."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("⚠️ الموعد يجب أن يكون في المستقبل، ومدة التسليم بين ساعة و720 ساعة."),parse_mode=ParseMode.HTML); return
     manual_kind=state["kind"]; kind="homework" if manual_kind=="homework" else "exam"
     if kind=="exam" and state.get("target_scope")!="course": state["target_scope"]="course"
     title=("[تراكمي] " if manual_kind=="cumulative" else "")+state["title"]
     row=await create_scheduled_task(kind,title,state["media"],publish_at,hours,update.effective_user.id,state.get("target_scope","course"))
     context.user_data.pop("manual_task",None)
-    await update.message.reply_text(bold(f"✅ تمت جدولة المنشور بنجاح.\n🆔 رقم الجدولة: {row['id']}\n🚀 موعد النشر: {publish_at.strftime('%d/%m/%Y %H:%M')}\n⏰ مدة التسليم بعد النشر: {hours} ساعة."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True))
+    await update.effective_message.reply_text(bold(f"✅ تمت جدولة المنشور بنجاح.\n🆔 رقم الجدولة: {row['id']}\n🚀 موعد النشر: {publish_at.strftime('%d/%m/%Y %H:%M')}\n⏰ مدة التسليم بعد النشر: {hours} ساعة."),parse_mode=ParseMode.HTML,reply_markup=main_menu(True))
 
 
 def rtl(value):
@@ -2699,6 +2720,22 @@ async def error_handler(update,context):
             except TelegramError:
                 pass
         return
+    # Telegram can close an idle connection; polling recovers by itself.
+    # Expired callback tokens cannot be answered again. Keep diagnostics in logs
+    # without flooding the owner chat every minute for these transient events.
+    if isinstance(context.error, (NetworkError, TimedOut)) or any(
+        cls.__module__.startswith('httpx') and cls.__name__ in
+        {'ReadError', 'ConnectError', 'RemoteProtocolError', 'ReadTimeout', 'ConnectTimeout'}
+        for cls in type(context.error).__mro__
+    ):
+        logger.warning('Temporary Telegram transport failure: %r', context.error)
+        return
+    if isinstance(context.error, BadRequest) and any(
+        phrase in str(context.error).lower() for phrase in
+        ('query is too old', 'response timeout expired', 'query id is invalid')
+    ):
+        logger.info('Expired Telegram callback; student can press the button again: %s', context.error)
+        return
     logger.exception("Unhandled error",exc_info=context.error)
     if OWNER_CHAT_ID:
         global _OWNER_ERROR_ALERT_AT
@@ -2765,6 +2802,26 @@ def acquire_single_instance_lock():
     return True
 
 
+async def parent_during_registration(update,context):
+    context.user_data.pop('registration',None)
+    context.user_data.pop('registration_started_at',None)
+    await parent_command(update,context)
+    return ConversationHandler.END
+
+
+async def cancel_registration(update,context):
+    context.user_data.pop('registration',None)
+    context.user_data.pop('registration_started_at',None)
+    await update.effective_message.reply_text('تم إلغاء تسجيل الطالب. يمكنك إرسال /parent مع رمز طالب، أو /start للبدء من جديد.')
+    return ConversationHandler.END
+
+
+async def parent_restart_registration(update,context):
+    await update.callback_query.answer()
+    context.user_data.clear()
+    return await start(update,context)
+
+
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is required")
     if not DATABASE_URL: raise RuntimeError("DATABASE_URL is required")
@@ -2772,15 +2829,16 @@ def main():
     threading.Thread(target=health_server,daemon=True).start()
     app=Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).post_init(post_init).post_shutdown(post_shutdown).build()
     registration=ConversationHandler(
-        entry_points=[CommandHandler("start",start), CallbackQueryHandler(v47_reset_confirm,pattern="^v47_reset_confirm$")],
+        entry_points=[CommandHandler("start",start), CallbackQueryHandler(parent_restart_registration,pattern="^parent_restart$"), CallbackQueryHandler(v47_reset_confirm,pattern="^v47_reset_confirm$")],
         states={REG_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,reg_name)],REG_SCHOOL:[MessageHandler(filters.TEXT & ~filters.COMMAND,reg_school)],REG_GRADE:[MessageHandler(filters.TEXT & ~filters.COMMAND,reg_grade)],REG_JOIN:[CallbackQueryHandler(verify_join,pattern="^verify_join$")]},
-        fallbacks=[CommandHandler("start",start)],allow_reentry=True,
+        fallbacks=[CommandHandler("start",start),CommandHandler("parent",parent_during_registration),CommandHandler("cancel",cancel_registration)],allow_reentry=True,conversation_timeout=1800,
     )
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE,spam_guard),group=-1)
     app.add_handler(ChatMemberHandler(track_chat_member,ChatMemberHandler.CHAT_MEMBER),group=-2)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS,observe_group_activity),group=-2)
     app.add_handler(registration,group=0)
     app.add_handler(CommandHandler("menu",menu_command),group=0)
+    app.add_handler(CommandHandler("cancel",cancel_registration),group=0)
     app.add_handler(CommandHandler("warn",warn_command),group=0)
     app.add_handler(CommandHandler("unwarn",unwarn_command),group=0)
     app.add_handler(CommandHandler("warnings",warnings_command),group=0)
@@ -2906,21 +2964,21 @@ async def v28_gamification_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def v28_admin_extend_exam_command(update,context):
     if not is_admin(update.effective_user.id): return
-    if len(context.args)<2 or not all(x.isdigit() for x in context.args[:2]): await update.message.reply_text(bold("الاستخدام: /extend_exam رقم_الامتحان عدد_الساعات"),parse_mode=ParseMode.HTML); return
+    if len(context.args)<2 or not all(x.isdigit() for x in context.args[:2]): await update.effective_message.reply_text(bold("الاستخدام: /extend_exam رقم_الامتحان عدد_الساعات"),parse_mode=ParseMode.HTML); return
     row=await db.v28_extend_exam(int(context.args[0]),int(context.args[1]))
-    await update.message.reply_text(bold("❌ لم يتم العثور على الامتحان." if not row else f"✅ تم تمديد الامتحان رقم {row['id']}.\n⏰ الموعد النهائي: {row['deadline'].astimezone(TIMEZONE).strftime('%d/%m/%Y %H:%M')}"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold("❌ لم يتم العثور على الامتحان." if not row else f"✅ تم تمديد الامتحان رقم {row['id']}.\n⏰ الموعد النهائي: {row['deadline'].astimezone(TIMEZONE).strftime('%d/%m/%Y %H:%M')}"),parse_mode=ParseMode.HTML)
 
 async def v28_exam_notice_command(update,context):
     if not is_admin(update.effective_user.id): return
     parts=[x.strip() for x in (update.message.text or "").partition(" ")[2].split("|")]
-    if len(parts)<4: await update.message.reply_text(bold("الاستخدام:\n/exam_notice المسار | العنوان | DD/MM/YYYY HH:MM | نص التبليغ\nالمسار: course أو chapter_1 ... chapter_5"),parse_mode=ParseMode.HTML); return
+    if len(parts)<4: await update.effective_message.reply_text(bold("الاستخدام:\n/exam_notice المسار | العنوان | DD/MM/YYYY HH:MM | نص التبليغ\nالمسار: course أو chapter_1 ... chapter_5"),parse_mode=ParseMode.HTML); return
     scope,title,when,body=parts[:4]
     try: exam_at=datetime.strptime(when,"%d/%m/%Y %H:%M").replace(tzinfo=TIMEZONE)
-    except ValueError: await update.message.reply_text(bold("❌ صيغة التاريخ غير صحيحة."),parse_mode=ParseMode.HTML); return
+    except ValueError: await update.effective_message.reply_text(bold("❌ صيغة التاريخ غير صحيحة."),parse_mode=ParseMode.HTML); return
     valid={"course",*(f"chapter_{i}" for i in range(1,6))}
-    if scope not in valid: await update.message.reply_text(bold("❌ المسار غير صحيح."),parse_mode=ParseMode.HTML); return
+    if scope not in valid: await update.effective_message.reply_text(bold("❌ المسار غير صحيح."),parse_mode=ParseMode.HTML); return
     row=await db.v28_create_exam_notice(title,body,scope,exam_at,update.effective_user.id)
-    await update.message.reply_text(bold(f"✅ تم حفظ تبليغ الامتحان.\n📌 {row['title']}\n📅 {exam_at.strftime('%d/%m/%Y %H:%M')}"),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ تم حفظ تبليغ الامتحان.\n📌 {row['title']}\n📅 {exam_at.strftime('%d/%m/%Y %H:%M')}"),parse_mode=ParseMode.HTML)
 
 legacy_button_handler=button_handler
 async def button_handler(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -3665,11 +3723,11 @@ async def v39_add_question_command(update,context):
     if not is_admin(update.effective_user.id): return
     parts=[p.strip() for p in (update.message.text or "").partition(" ")[2].split("|")]
     if len(parts)<3 or not parts[0].isdigit() or int(parts[0]) not in range(1,6):
-        await update.message.reply_text(bold("الاستخدام:\n/add_question الفصل | السؤال | الإجابة | الصعوبة"),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("الاستخدام:\n/add_question الفصل | السؤال | الإجابة | الصعوبة"),parse_mode=ParseMode.HTML); return
     difficulty=parts[3].lower() if len(parts)>3 else "medium"
     if difficulty not in {"easy","medium","hard"}: difficulty="medium"
     row=await db.v37_add_question(int(parts[0]),parts[1][:2000],parts[2][:2000],difficulty,"manual")
-    await update.message.reply_text(bold(f"✅ أضيف السؤال رقم {row['id']} إلى الفصل {row['chapter']}."),parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(bold(f"✅ أضيف السؤال رقم {row['id']} إلى الفصل {row['chapter']}."),parse_mode=ParseMode.HTML)
 
 # Keep the existing handler chain intact, but give the v37 callbacks authoritative routing.
 _v37_previous_button_handler=button_handler
@@ -4174,31 +4232,31 @@ async def private_messages(update,context):
     review_id=context.user_data.get("v41_review_oath_id")
     if review_id:
         if _v41_normalize_oath(text)!=_v41_normalize_oath(ROYAL_REVIEW_OATH):
-            await update.message.reply_text(f"<b>القسم غير مطابق. انسخ النص التالي كاملا:</b>\n\n<code>{escape(ROYAL_REVIEW_OATH)}</code>",parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(f"<b>القسم غير مطابق. انسخ النص التالي كاملا:</b>\n\n<code>{escape(ROYAL_REVIEW_OATH)}</code>",parse_mode=ParseMode.HTML); return
         result=await db.v41_complete_review(update.effective_user.id,int(review_id))
         if result.get("status")=="ok":
             context.user_data.pop("v41_review_oath_id",None); row=result["review"]
-            await update.message.reply_text(bold(f"✅ تم تسجيل المراجعة {row['stage']} للمحاضرة {row['lecture']} من الفصل {row['chapter']}.\nاستمر على المواعيد الاربعة حتى تثبت المادة باقوى صورة."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 المراجعة التالية",callback_data="royal_review_menu"),back_menu()]])); return
-        await update.message.reply_text(bold("تعذر تسجيل المراجعة او لم يحن موعدها بعد."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold(f"✅ تم تسجيل المراجعة {row['stage']} للمحاضرة {row['lecture']} من الفصل {row['chapter']}.\nاستمر على المواعيد الاربعة حتى تثبت المادة باقوى صورة."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 المراجعة التالية",callback_data="royal_review_menu"),back_menu()]])); return
+        await update.effective_message.reply_text(bold("تعذر تسجيل المراجعة او لم يحن موعدها بعد."),parse_mode=ParseMode.HTML); return
     weakness_id=context.user_data.get("v41_weakness_oath_id")
     if weakness_id:
         if _v41_normalize_oath(text)!=_v41_normalize_oath(WEAKNESS_RESOLUTION_OATH):
-            await update.message.reply_text(f"<b>القسم غير مطابق. انسخ النص التالي كاملا:</b>\n\n<code>{escape(WEAKNESS_RESOLUTION_OATH)}</code>",parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(f"<b>القسم غير مطابق. انسخ النص التالي كاملا:</b>\n\n<code>{escape(WEAKNESS_RESOLUTION_OATH)}</code>",parse_mode=ParseMode.HTML); return
         result=await db.v41_resolve_weakness(update.effective_user.id,int(weakness_id))
         if result.get("status")=="ok":
             context.user_data.pop("v41_weakness_oath_id",None); row=result["weakness"]
-            await update.message.reply_text(bold(f"✅ احسنت، تم حل نقطة الضعف وحذفها من قائمتك.\n⭐ حصلت على {result['xp']} XP."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 نقاط ضعفي",callback_data="weaknesses_menu"),InlineKeyboardButton("◀️ المحاضرة",callback_data=f"weak_lecture|{row['chapter']}|{row['lecture']}")]])); return
+            await update.effective_message.reply_text(bold(f"✅ احسنت، تم حل نقطة الضعف وحذفها من قائمتك.\n⭐ حصلت على {result['xp']} XP."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 نقاط ضعفي",callback_data="weaknesses_menu"),InlineKeyboardButton("◀️ المحاضرة",callback_data=f"weak_lecture|{row['chapter']}|{row['lecture']}")]])); return
         context.user_data.pop("v41_weakness_oath_id",None)
-        await update.message.reply_text(bold("نقطة الضعف غير موجودة او تم حلها مسبقا."),parse_mode=ParseMode.HTML); return
+        await update.effective_message.reply_text(bold("نقطة الضعف غير موجودة او تم حلها مسبقا."),parse_mode=ParseMode.HTML); return
     weakness=context.user_data.get("v41_weakness_add")
     if weakness:
         if len(text)<3:
-            await update.message.reply_text(bold("اكتب نقطة ضعف واضحة من 3 احرف على الاقل."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("اكتب نقطة ضعف واضحة من 3 احرف على الاقل."),parse_mode=ParseMode.HTML); return
         row=await db.v41_add_weakness(update.effective_user.id,weakness["chapter"],weakness["lecture"],text)
         if not row:
-            await update.message.reply_text(bold("تعذر حفظ نقطة الضعف."),parse_mode=ParseMode.HTML); return
+            await update.effective_message.reply_text(bold("تعذر حفظ نقطة الضعف."),parse_mode=ParseMode.HTML); return
         context.user_data.pop("v41_weakness_add",None)
-        await update.message.reply_text(bold(f"✅ تم حفظ نقطة الضعف داخل الفصل {row['chapter']} - المحاضرة {row['lecture']}."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 عرض نقاط المحاضرة",callback_data=f"weak_lecture|{row['chapter']}|{row['lecture']}")],[back_menu()]])); return
+        await update.effective_message.reply_text(bold(f"✅ تم حفظ نقطة الضعف داخل الفصل {row['chapter']} - المحاضرة {row['lecture']}."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 عرض نقاط المحاضرة",callback_data=f"weak_lecture|{row['chapter']}|{row['lecture']}")],[back_menu()]])); return
     return await _v41_previous_private_messages(update,context)
 
 
@@ -5076,7 +5134,7 @@ async def start(update,context):
     student=await get_student(update.effective_user.id)
     if student and student.get('reset_pending'):
         context.user_data.clear(); context.user_data['registration']={}
-        await update.message.reply_text('✍️ أرسل اسمك الثلاثي أو الرباعي لإكمال إعادة التسجيل:')
+        await update.effective_message.reply_text('✍️ أرسل اسمك الثلاثي أو الرباعي لإكمال إعادة التسجيل:')
         return REG_NAME
     return await _v47_previous_start(update,context)
 
@@ -5104,13 +5162,17 @@ async def reg_grade(update,context):
     try: grade=float(value)
     except ValueError: grade=-1
     if not 0<=grade<=100:
-        await update.message.reply_text('أرسل معدلاً بين 0 و100، مثل 97.2.'); return REG_GRADE
+        await update.effective_message.reply_text('أرسل معدلاً بين 0 و100، مثل 97.2.'); return REG_GRADE
     reg=context.user_data.get('registration',{})
     if not reg.get('full_name') or not reg.get('school'):
         return await start(update,context)
-    await register_student(update.effective_user.id,update.effective_user.username,reg['full_name'],reg['school'],value)
+    registered=await register_student(update.effective_user.id,update.effective_user.username,reg['full_name'],reg['school'],value)
+    if registered.get('status')=='parent_account':
+        context.user_data.pop('registration',None)
+        await update.effective_message.reply_text('هذا الحساب مربوط كولي أمر. احذف حساب ولي الأمر أولاً إذا تريد تسجله كطالب.')
+        return ConversationHandler.END
     context.user_data.pop('registration',None)
-    await update.message.reply_text('📚 اختر مسار دراستك:',reply_markup=onboarding_track_keyboard())
+    await update.effective_message.reply_text('📚 اختر مسار دراستك:',reply_markup=onboarding_track_keyboard())
     return ConversationHandler.END
 
 
@@ -5131,7 +5193,7 @@ async def v47_finish_track(query,track,chapter=3,prep_no=1):
         text+=f"\n\nلربط ولي الأمر يرسل من حسابه:\n/parent {student['parent_link_code']}"
     elif not student.get('approved'):
         text+='\n\nحسابك ينتظر تفعيل الإدارة.'
-    await query.edit_message_text(text,reply_markup=main_menu() if student.get('approved') else None)
+    await query.edit_message_text(text,reply_markup=main_menu() if student.get('approved') else parent_copy_markup(student['parent_link_code']))
 
 
 async def v47_window_help(query,definition_id):
@@ -5156,8 +5218,8 @@ async def v47_exam_window_command(update,context):
         changed=await db.v47_set_exam_window(int(identifier),publish,end)
     except (ValueError,TypeError): changed=False
     if not changed:
-        await update.message.reply_text('تعذر الحفظ. تحقق من رقم الامتحان وتاريخ مستقبلي، وأنه لم يبدأ للطلاب.\nالصيغة:\n/exam_window 12 2026-09-10 11:00 | 2026-09-11 11:00'); return
-    await update.message.reply_text(f'✅ حُفظ موعد النشر {publish:%Y-%m-%d %H:%M} والانتهاء {end:%Y-%m-%d %H:%M} بتوقيت بغداد.')
+        await update.effective_message.reply_text('تعذر الحفظ. تحقق من رقم الامتحان وتاريخ مستقبلي، وأنه لم يبدأ للطلاب.\nالصيغة:\n/exam_window 12 2026-09-10 11:00 | 2026-09-11 11:00'); return
+    await update.effective_message.reply_text(f'✅ حُفظ موعد النشر {publish:%Y-%m-%d %H:%M} والانتهاء {end:%Y-%m-%d %H:%M} بتوقيت بغداد.')
 
 
 async def v47_window_notices_job(context):
@@ -5467,11 +5529,11 @@ async def receive_submission(update: Update,context: ContextTypes.DEFAULT_TYPE):
     student=await get_student(update.effective_user.id)
     if not student or not student.get('approved') or not student.get('parent_chat_id') or not await is_channel_member(context.bot,update.effective_user.id):
         context.user_data.pop('waiting_submission',None)
-        await update.message.reply_text(bold('🔒 لا يمكنك التسليم: يجب تفعيل الحساب وربط ولي الامر والاشتراك بالقناة.'),parse_mode=ParseMode.HTML); return True
+        await update.effective_message.reply_text(bold('🔒 لا يمكنك التسليم: يجب تفعيل الحساب وربط ولي الامر والاشتراك بالقناة.'),parse_mode=ParseMode.HTML); return True
     task=await get_task(task_id); effective=await effective_task_deadline(task_id,update.effective_user.id) if task else None
     if not task or not effective or not effective.get('assigned') or datetime.now(TIMEZONE)>=effective['deadline']:
         context.user_data.pop('waiting_submission',None)
-        await update.message.reply_text(bold('⏰ انتهى وقت التسليم. استخدم التمديد او اطلب موافقة الاستاذ ثم اعد الارسال.'),parse_mode=ParseMode.HTML); return True
+        await update.effective_message.reply_text(bold('⏰ انتهى وقت التسليم. استخدم التمديد او اطلب موافقة الاستاذ ثم اعد الارسال.'),parse_mode=ParseMode.HTML); return True
     msg=update.effective_message; media=msg.document or (msg.photo[-1] if msg.photo else None) or msg.video
     if not media:
         await msg.reply_text(bold('⚠️ ارسل صورة او ملف PDF او فيديو كحل.'),parse_mode=ParseMode.HTML); return True
@@ -7652,6 +7714,29 @@ async def v55_exam_study_menu(query,chapter,lecture):
 
 _v55_previous_button_handler=button_handler
 async def button_handler(update,context):
+    data=update.callback_query.data or ''
+    query=update.callback_query
+    uid=query.from_user.id
+    if data=='parent_delete':
+        if await get_student(uid) or not await students_by_parent(uid,False):
+            await query.answer('لا يوجد حساب ولي أمر قابل للحذف.',show_alert=True); return
+        context.user_data['parent_delete_requested_at']=datetime.now(TIMEZONE)
+        await query.answer()
+        await query.edit_message_text('⚠️ حذف حساب ولي الأمر نهائياً\n\nسيُلغى ربطك بجميع الطلاب، ولن تُحذف بيانات أي طالب. يمكن التسجيل من البداية بعد الحذف. هل تؤكد؟',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🗑 نعم، احذف حسابي',callback_data='parent_delete_confirm',style='danger')],
+                [InlineKeyboardButton('❌ تراجع',callback_data='parent_menu',style='primary')]])); return
+    if data=='parent_delete_confirm':
+        requested=context.user_data.pop('parent_delete_requested_at',None)
+        if not requested or datetime.now(TIMEZONE)-requested>timedelta(minutes=10):
+            await query.answer('انتهت مهلة التأكيد، افتح واجهة ولي الأمر وأعد الطلب.',show_alert=True); return
+        result=await db.delete_parent_account(uid)
+        if result['status']!='deleted':
+            await query.answer('تعذر الحذف. تحقق من نوع الحساب أو أعد فتح /start.',show_alert=True); return
+        context.user_data.clear()
+        await query.answer('حُذف حساب ولي الأمر')
+        await query.edit_message_text('✅ حُذف حساب ولي الأمر وأُلغي ربطك بجميع الطلاب، مع بقاء ملفاتهم محفوظة. اضغط البدء من جديد أو أرسل /start.',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🆕 البدء من جديد',callback_data='parent_restart',style='success')]]))
+        return
     query=update.callback_query; data=query.data or ''; uid=query.from_user.id
     if data.startswith('prepcomplete|') and not is_admin(uid):
         try:
@@ -7726,6 +7811,13 @@ async def button_handler(update,context):
 
 _v55_previous_private_messages=private_messages
 async def private_messages(update,context):
+    if 'registration' in context.user_data:
+        started=context.user_data.get('registration_started_at')
+        if started is None or datetime.now(TIMEZONE)-started>timedelta(minutes=30):
+            context.user_data.pop('registration',None)
+            context.user_data.pop('registration_started_at',None)
+            await update.effective_message.reply_text('انتهت مهلة التسجيل غير المكتمل. أرسل /start حتى تبدأ من جديد.')
+            return
     state=context.user_data.get('awaiting_exam_bank_oath'); uid=update.effective_user.id
     if state and not is_admin(uid):
         msg=update.effective_message
