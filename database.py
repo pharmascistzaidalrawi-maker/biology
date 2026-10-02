@@ -1,3 +1,5 @@
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 import asyncio
 import os
 import threading
@@ -701,9 +703,25 @@ async def activate_exam(task_id,user_id,approved_by,hours=None):
             if not current: return None
             effective_hours=max(1,int(hours or current.get('exam_duration_hours') or 24))
             now=datetime_now(cur);deadline=now+timedelta(hours=effective_hours)
+            available=now
+            if current.get('exam_definition_id'):
+                # Approval grants access; it must not silently reschedule a published exam.
+                available=current.get('exam_available_at') or now
+                deadline=current['deadline']
+                cur.execute('SELECT extended_until FROM biology_task_extensions WHERE task_id=%s AND user_id=%s;', (task_id,user_id))
+                extension=cur.fetchone()
+                effective_deadline=max(deadline,extension['extended_until']) if extension else deadline
+                if current.get('closed') or available>now or effective_deadline<=now: return None
+            if current.get('school_review_id'):
+                cur.execute('SELECT * FROM biology_school_reviews WHERE id=%s FOR UPDATE;',(current['school_review_id'],))
+                review=cur.fetchone()
+                if not review or review.get('exam_deleted') or review.get('exam_manual_closed'): return None
+                available=review.get('exam_opens_at') or current.get('exam_available_at') or now
+                deadline=review.get('exam_closes_at') or current['deadline']
+                if available>now or deadline<=now: return None
             cur.execute("""UPDATE biology_tasks SET exam_pending_activation=FALSE,deadline=%s,closed=FALSE,
                 exam_available_at=%s,published_at=COALESCE(published_at,%s)
-                WHERE id=%s RETURNING *;""",(deadline,now,now,task_id));task=cur.fetchone()
+                WHERE id=%s RETURNING *;""",(deadline,available,now,task_id));task=cur.fetchone()
             cur.execute("UPDATE biology_exam_access SET status='approved',approved_by=%s,approved_at=CURRENT_TIMESTAMP WHERE task_id=%s AND user_id=%s;",(approved_by,task_id,user_id))
             conn.commit();return task
     return await run(op)
@@ -755,7 +773,8 @@ async def add_linked_exam_lectures(definition_id, lectures):
     return await run(op)
 
 
-async def create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope="chapter",selected_lectures=None,exam_type="normal",duration_hours=2):
+async def create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope="chapter",selected_lectures=None,exam_type="normal",duration_hours=2,difficulty="easy"):
+    if difficulty not in {"easy","hard"}: raise ValueError("Invalid difficulty")
     pairs=sorted({(int(c),int(p)) for c,p in (selected_pairs or [])})
     lectures=sorted({(int(c),int(l)) for c,l in (selected_lectures or [])})
     if not pairs and not lectures: raise ValueError("At least one preparation or lecture is required")
@@ -767,7 +786,7 @@ async def create_linked_exam_definition(selected_pairs,title,created_by,media,ta
             if clean_type=='cumulative' and not clean_title.startswith('[تراكمي]'):
                 clean_title='[تراكمي] '+clean_title
             clean_hours=max(1,min(168,int(duration_hours or 2)))
-            cur.execute("INSERT INTO biology_linked_exam_definitions(chapter,prep_no,title,created_by,target_scope,exam_type,duration_hours,availability_mode,release_hour,release_next_day) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,18,%s) RETURNING *;",(chapter,pairs[0][1] if pairs else None,clean_title,created_by,target_scope,clean_type,clean_hours,"course_next_day" if target_scope=="course" else "completion_approval",target_scope=="course"))
+            cur.execute("INSERT INTO biology_linked_exam_definitions(chapter,prep_no,title,created_by,target_scope,exam_type,duration_hours,availability_mode,release_hour,release_next_day,difficulty) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,18,%s,%s) RETURNING *;",(chapter,pairs[0][1] if pairs else None,clean_title,created_by,target_scope,clean_type,clean_hours,"course_next_day" if target_scope=="course" else "completion_approval",target_scope=="course",difficulty))
             row=cur.fetchone()
             for pos,(ch,pno) in enumerate(pairs):
                 cur.execute("INSERT INTO biology_linked_exam_preparations(definition_id,chapter,prep_no,position) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING;",(row["id"],ch,pno,pos))
@@ -1659,7 +1678,7 @@ async def request_extension(task_id,user_id,hours=24):
             WHERE user_id=%s AND requested_at>=DATE_TRUNC('week',CURRENT_TIMESTAMP);""",(user_id,)); used=cur.fetchone()["n"]
             if used>=2: return {"status":"limit","used":used}
             cur.execute("SELECT deadline,closed FROM biology_tasks WHERE id=%s;",(task_id,)); task=cur.fetchone()
-            if not task or task["closed"]: return {"status":"closed"}
+            if not task or task["closed"] or task["deadline"]<=datetime_now(cur): return {"status":"closed"}
             extended_until=max(task["deadline"],datetime_now(cur))+timedelta(hours=min(24,max(1,hours)))
             cur.execute("""INSERT INTO biology_task_extensions(task_id,user_id,extended_until) VALUES(%s,%s,%s)
             ON CONFLICT(task_id,user_id) DO NOTHING RETURNING *;""",(task_id,user_id,extended_until)); row=cur.fetchone()
@@ -2405,6 +2424,12 @@ async def add_warning(user_id,reason,issued_by=0,task_id=None):
             cur.execute("SELECT warnings FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
             if not student: return 0
             if task_id:
+                cur.execute("SELECT exam_difficulty FROM biology_tasks WHERE id=%s;",(task_id,))
+                exam=cur.fetchone()
+                if exam and exam.get('exam_difficulty')=='hard':
+                    cur.execute("SELECT warnings FROM biology_students WHERE user_id=%s;",(user_id,))
+                    student=cur.fetchone(); return student['warnings'] if student else 0
+            if task_id:
                 cur.execute("SELECT 1 FROM biology_warning_log WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
                 if cur.fetchone():
                     return student["warnings"]
@@ -2419,6 +2444,10 @@ async def add_warning_once(user_id,reason,issued_by=0,task_id=None):
         with connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT warnings,approved,reset_pending FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
             if not student: return {"count":0,"created":False}
+            if task_id:
+                cur.execute("SELECT exam_difficulty FROM biology_tasks WHERE id=%s;",(task_id,))
+                exam=cur.fetchone()
+                if exam and exam.get('exam_difficulty')=='hard': return {"count":student['warnings'],"created":False}
             if task_id and int(issued_by or 0)==0:
                 if not student['approved'] or student.get('reset_pending'): return {"count":student['warnings'],"created":False}
                 # Recheck under the same student lock used by record_submission.
@@ -2580,7 +2609,7 @@ async def v28_ready_personal_exams():
         with connect() as conn, conn.cursor() as cur:
             cur.execute("""SELECT d.id definition_id,s.user_id FROM biology_linked_exam_definitions d JOIN biology_students s ON
             s.approved=TRUE AND d.target_scope='chapter' AND s.study_track='chapter' AND s.current_chapter=d.chapter
-            WHERE NOT EXISTS(SELECT 1 FROM biology_tasks t WHERE t.exam_definition_id=d.id AND t.target_scope='student:'||s.user_id);""")
+            WHERE NOT EXISTS(SELECT 1 FROM biology_tasks t WHERE t.exam_definition_id=d.id AND t.target_scope='student:'||s.user_id::text);""")
             candidates=cur.fetchall(); ready=[]
             for c in candidates:
                 cur.execute("SELECT chapter,lecture FROM biology_linked_exam_lectures WHERE definition_id=%s ORDER BY position;",(c['definition_id'],)); lectures=cur.fetchall()
@@ -2955,7 +2984,7 @@ async def v54_school_review_catalog(user_id=None):
         with connect() as conn,conn.cursor() as cur:
             params=[]; join=''; columns=''
             if user_id is not None:
-                columns=",p.completed_at,p.xp_awarded,p.task_id,t.exam_pending_activation,t.deadline,t.closed,sub.submitted_at,access.status AS approval_status"
+                columns=",p.completed_at,p.xp_awarded,p.task_id,t.exam_pending_activation,GREATEST(t.deadline,COALESCE((SELECT e.extended_until FROM biology_task_extensions e WHERE e.task_id=t.id AND e.user_id=p.user_id),t.deadline)) AS deadline,t.closed,sub.submitted_at,access.status AS approval_status"
                 join="""LEFT JOIN biology_school_review_progress p ON p.review_id=r.id AND p.user_id=%s
                     LEFT JOIN biology_tasks t ON t.id=p.task_id
                     LEFT JOIN biology_submissions sub ON sub.task_id=t.id AND sub.user_id=%s
@@ -3022,6 +3051,7 @@ async def v54_replace_school_review_exam_media(review_id,items,created_by):
             cur.execute("SELECT id FROM biology_school_reviews WHERE id=%s AND active=TRUE FOR UPDATE;",(int(review_id),))
             if not cur.fetchone(): return 0
             cur.execute("DELETE FROM biology_school_review_exam_media WHERE review_id=%s;",(int(review_id),))
+            cur.execute('UPDATE biology_school_reviews SET exam_deleted=FALSE WHERE id=%s;',(int(review_id),))
             for position,(payload,file_id,content) in enumerate(clean):
                 cur.execute("""INSERT INTO biology_school_review_exam_media
                     (review_id,payload_type,file_id,text_content,position,created_by)
@@ -3064,10 +3094,11 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
         JOIN biology_school_review_progress p ON p.review_id=r.id AND p.user_id=e.user_id
             AND p.completed_at IS NOT NULL
         WHERE r.id=%s AND r.active=TRUE
-          AND r.exam_date<=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
+          AND r.exam_deleted=FALSE
         FOR UPDATE OF r;""",(int(user_id),int(review_id)))
     review=cur.fetchone()
-    if not review: return None
+    if not review or review.get('exam_deleted'): return None
+    available=review.get('exam_opens_at') or datetime.combine(review['exam_date'],time(18),tzinfo=ZoneInfo('Asia/Baghdad'))
     cur.execute("SELECT * FROM biology_school_review_exam_media WHERE review_id=%s ORDER BY position,id;",(int(review_id),))
     media=cur.fetchall()
     if not media: return None
@@ -3081,7 +3112,7 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
             if item['payload_type']=='text' and str(item.get('text_content') or '').strip())
         synthetic=-(880000000000000000+int(review_id)*100000000000+int(user_id)%100000000000)
         title=f"مراجعة المدرسة — الأسبوع {review['week_label']}"
-        deadline=datetime_now(cur)+timedelta(days=3650)
+        deadline=review.get('exam_closes_at') or available+timedelta(hours=24)
         cur.execute("""INSERT INTO biology_tasks
             (kind,title,chat_id,thread_id,source_message_id,payload_type,file_id,text_content,deadline,
              xp_reward,created_by,target_scope,linked_lectures,exam_pending_activation,
@@ -3107,6 +3138,9 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
             VALUES(%s,%s,'pending') ON CONFLICT(task_id,user_id) DO NOTHING;""",(task['id'],int(user_id)))
         cur.execute("UPDATE biology_school_review_progress SET task_id=%s WHERE review_id=%s AND user_id=%s;",
             (task['id'],int(review_id),int(user_id)))
+    if task:
+        cur.execute('UPDATE biology_tasks SET exam_available_at=%s WHERE id=%s RETURNING *;',(available,task['id']))
+        task=cur.fetchone()
     return task
 
 
@@ -3119,13 +3153,13 @@ async def v54_complete_school_review(review_id,user_id):
                     AND s.reset_pending=FALSE AND s.study_track='course'
                 WHERE r.id=%s AND r.active=TRUE AND r.published_at IS NOT NULL
                   AND r.publish_date<=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
-                  AND r.exam_date>=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
+                  
                 FOR UPDATE OF r,s;""",(int(user_id),int(review_id)))
             review=cur.fetchone()
             if not review: return {'status':'unavailable'}
             cur.execute("""INSERT INTO biology_school_review_progress(review_id,user_id,completed_at,xp_awarded)
                 VALUES(%s,%s,CURRENT_TIMESTAMP,FALSE)
-                ON CONFLICT(review_id,user_id) DO NOTHING RETURNING *;""",(int(review_id),int(user_id)))
+                ON CONFLICT(review_id,user_id) DO UPDATE SET completed_at=COALESCE(biology_school_review_progress.completed_at,EXCLUDED.completed_at) RETURNING *;""",(int(review_id),int(user_id)))
             inserted=cur.fetchone(); awarded=0
             if inserted:
                 awarded=_set_xp_event(cur,int(user_id),30,'إكمال مراجعة المدرسة',f'school_review:{int(review_id)}:{int(user_id)}')
@@ -3141,6 +3175,13 @@ async def v54_prepare_school_review_exam(review_id,user_id):
         with connect() as conn,conn.cursor() as cur:
             task=_v54_ensure_school_review_task(cur,int(review_id),int(user_id))
             if not task: return {'status':'waiting'}
+            now=datetime_now(cur)
+            cur.execute('SELECT extended_until FROM biology_task_extensions WHERE task_id=%s AND user_id=%s;',(task['id'],int(user_id)))
+            extension=cur.fetchone() or {}
+            until=extension.get('extended_until')
+            effective=max(task['deadline'],until) if until else task['deadline']
+            if task.get('exam_available_at') and task['exam_available_at']>now: return {'status':'scheduled','task':task}
+            if effective<=now or (task.get('closed') and not (until and until>now)): return {'status':'closed','task':task}
             cur.execute("SELECT submitted_at FROM biology_submissions WHERE task_id=%s AND user_id=%s;",(task['id'],int(user_id)))
             submitted=cur.fetchone()
             if submitted and submitted.get('submitted_at'): return {'status':'submitted','task':task}
@@ -3234,7 +3275,9 @@ async def v54_due_school_review_exams(limit=100):
                 JOIN biology_students s ON s.user_id=p.user_id AND s.approved=TRUE
                     AND s.reset_pending=FALSE AND s.study_track='course'
                 WHERE p.completed_at IS NOT NULL
-                  AND r.exam_date<=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
+                  AND r.exam_deleted=FALSE AND r.exam_manual_closed=FALSE
+                  AND COALESCE(r.exam_opens_at,((r.exam_date+TIME '18:00') AT TIME ZONE 'Asia/Baghdad'))<=CURRENT_TIMESTAMP
+                  AND COALESCE(r.exam_closes_at,((r.exam_date+TIME '18:00') AT TIME ZONE 'Asia/Baghdad')+INTERVAL '24 hours')>CURRENT_TIMESTAMP
                   AND EXISTS(SELECT 1 FROM biology_school_review_exam_media m WHERE m.review_id=r.id)
                   AND (p.task_id IS NULL OR p.approval_notified_at IS NULL)
                 ORDER BY r.week_no,p.user_id LIMIT %s;""",(max(1,min(500,int(limit))),))
@@ -3306,7 +3349,7 @@ async def v29_ready_personal_exams():
             cur.execute("""SELECT d.id definition_id,s.user_id,d.title FROM biology_linked_exam_definitions d
                 JOIN biology_students s ON s.approved=TRUE AND s.onboarding_version>=19
                 WHERE d.target_scope='chapter' AND s.study_track='chapter' AND s.current_chapter=d.chapter
-                AND NOT EXISTS(SELECT 1 FROM biology_tasks t WHERE t.exam_definition_id=d.id AND t.target_scope='student:'||s.user_id);""")
+                AND NOT EXISTS(SELECT 1 FROM biology_tasks t WHERE t.exam_definition_id=d.id AND t.target_scope='student:'||s.user_id::text);""")
             candidates=cur.fetchall(); ready=[]
             for c in candidates:
                 required=set()
@@ -4863,7 +4906,7 @@ async def student_exam_lock(user_id):
                       WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
+                    (d.target_scope='chapter' AND st.study_track='chapter') OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -4887,7 +4930,7 @@ async def v28_student_exam_tasks(user_id):
                   AND (d.id IS NULL OR d.deleted_at IS NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
+                    (d.target_scope='chapter' AND st.study_track='chapter') OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5369,9 +5412,9 @@ async def v42_mark_missing_exam_reminded(prep_no):
 
 
 _v42_previous_create_linked_exam_definition=create_linked_exam_definition
-async def create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope="chapter",selected_lectures=None,exam_type="normal",duration_hours=2):
+async def create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope="chapter",selected_lectures=None,exam_type="normal",duration_hours=2,difficulty="easy"):
     """Create an exam and snapshot the exact lectures selected by the teacher."""
-    row=await _v42_previous_create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope,selected_lectures,exam_type,duration_hours)
+    row=await _v42_previous_create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope,selected_lectures,exam_type,duration_hours,difficulty)
     pairs=sorted({(int(ch),int(prep)) for ch,prep in (selected_pairs or [])})
     if row and pairs:
         def op():
@@ -5415,13 +5458,7 @@ def init_db():
 # ========================= v44 STUDY FLOW RELIABILITY =========================
 
 async def v44_free_exam_extension(task_id,user_id,hours=24):
-    """Use the weekly extension even when the exam already expired.
-
-    The student row is locked first, so two fast button presses cannot consume
-    the same weekly allowance twice. Reopening also clears only the warning
-    generated by this exact exam and gives the student a genuinely fresh
-    deadline.
-    """
+    """Extend an open exam; expired exams require the paid approval path."""
     def op():
         h=max(1,min(24,int(hours)))
         with connect() as conn, conn.cursor() as cur:
@@ -5443,6 +5480,10 @@ async def v44_free_exam_extension(task_id,user_id,hours=24):
                 FOR UPDATE OF t;""",(int(user_id),int(task_id)))
             task=cur.fetchone()
             if not task: return {"status":"not_found"}
+            cur.execute("SELECT extended_until FROM biology_task_extensions WHERE task_id=%s AND user_id=%s;",(int(task_id),int(user_id)))
+            existing_extension=cur.fetchone()
+            effective=max(task['deadline'],existing_extension['extended_until']) if existing_extension else task['deadline']
+            if task.get('closed') or effective<=task['now']: return {'status':'paid_required'}
             cur.execute("SELECT 1 FROM biology_submissions WHERE task_id=%s AND user_id=%s AND submitted_at IS NOT NULL;",(int(task_id),int(user_id)))
             if cur.fetchone(): return {"status":"submitted"}
             cur.execute("SELECT (CURRENT_DATE-(EXTRACT(ISODOW FROM CURRENT_DATE)::INTEGER-1))::DATE AS week_start;")
@@ -5493,7 +5534,7 @@ async def student_exam_lock(user_id):
                       WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
+                    (d.target_scope='chapter' AND st.study_track='chapter') OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5643,7 +5684,7 @@ async def student_exam_lock(user_id):
                       WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
+                    (d.target_scope='chapter' AND st.study_track='chapter') OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5672,7 +5713,7 @@ async def v28_student_exam_tasks(user_id):
                     WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
+                    (d.target_scope='chapter' AND st.study_track='chapter') OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5689,10 +5730,10 @@ async def v45_exam_task_status(user_id,task_id):
             cur.execute("""SELECT t.*,d.target_scope AS definition_scope,d.chapter AS definition_chapter,
                     (COALESCE(t.published_at,t.exam_available_at,d.created_at,t.created_at)>=(
                       COALESCE((SELECT value::date FROM biology_settings WHERE key='v45_exam_enforcement_cutoff'),DATE '2026-09-27')
-                      AT TIME ZONE 'Asia/Baghdad') OR COALESCE(e.extended_until>CURRENT_TIMESTAMP,FALSE)) AS enforced,
+                      AT TIME ZONE 'Asia/Baghdad') OR t.school_review_id IS NOT NULL OR COALESCE(e.extended_until>CURRENT_TIMESTAMP,FALSE)) AS enforced,
                     ((d.target_scope='course' AND st.study_track='course') OR
-                     (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
-                     (d.id IS NULL AND (t.target_scope='all' OR
+                     (d.target_scope='chapter' AND st.study_track='chapter') OR
+                     (d.id IS NULL AND ((t.school_review_id IS NOT NULL AND t.target_scope='student:'||st.user_id::text AND st.approved=TRUE AND st.reset_pending=FALSE AND st.study_track='course' AND EXISTS(SELECT 1 FROM biology_school_review_students se JOIN biology_school_reviews sr ON sr.id=t.school_review_id WHERE se.user_id=st.user_id AND se.active=TRUE AND sr.active=TRUE AND sr.exam_deleted=FALSE)) OR t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))) AS track_allowed,
                     GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS effective_deadline,
@@ -5719,7 +5760,7 @@ async def v45_request_late_exam(task_id,user_id,xp_cost=150,hours=2):
                     GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS effective_deadline,
                     (COALESCE(t.published_at,t.exam_available_at,d.created_at,t.created_at)>=(
                       COALESCE((SELECT value::date FROM biology_settings WHERE key='v45_exam_enforcement_cutoff'),DATE '2026-09-27')
-                      AT TIME ZONE 'Asia/Baghdad') OR COALESCE(e.extended_until>CURRENT_TIMESTAMP,FALSE)) AS enforced
+                      AT TIME ZONE 'Asia/Baghdad') OR t.school_review_id IS NOT NULL OR COALESCE(e.extended_until>CURRENT_TIMESTAMP,FALSE)) AS enforced
                 FROM biology_tasks t
                 JOIN biology_task_students ts ON ts.task_id=t.id AND ts.user_id=%s
                 JOIN biology_students s ON s.user_id=ts.user_id
@@ -5727,8 +5768,8 @@ async def v45_request_late_exam(task_id,user_id,xp_cost=150,hours=2):
                 LEFT JOIN biology_task_extensions e ON e.task_id=t.id AND e.user_id=ts.user_id
                 WHERE t.id=%s AND t.kind='exam' AND (d.id IS NULL OR d.deleted_at IS NULL)
                   AND ((d.target_scope='course' AND s.study_track='course') OR
-                    (d.target_scope='chapter' AND s.study_track='chapter' AND d.chapter=s.current_chapter) OR
-                    (d.id IS NULL AND (t.target_scope='all' OR
+                    (d.target_scope='chapter' AND s.study_track='chapter') OR
+                    (d.id IS NULL AND ((t.school_review_id IS NOT NULL AND t.target_scope='student:'||s.user_id::text AND s.approved=TRUE AND s.reset_pending=FALSE AND s.study_track='course' AND EXISTS(SELECT 1 FROM biology_school_review_students se JOIN biology_school_reviews sr ON sr.id=t.school_review_id WHERE se.user_id=s.user_id AND se.active=TRUE AND sr.active=TRUE AND sr.exam_deleted=FALSE)) OR t.target_scope='all' OR
                       (s.study_track='course' AND t.target_scope='course') OR
                       (s.study_track='chapter' AND t.target_scope='chapter_'||s.current_chapter))))
                 FOR UPDATE OF t,s;""",(int(user_id),int(task_id)))
@@ -6239,15 +6280,18 @@ async def _v47_create_task_atomic(definition_id,user_id,publish_at,deadline,opti
                     if not cur.fetchone(): return None
             cur.execute('SELECT payload_type,file_id FROM biology_linked_exam_media WHERE definition_id=%s ORDER BY position,id;', (definition_id,)); media=cur.fetchall()
             if not media: return None
-            duration_hours=max(1,int(((deadline_local-publish_at_local).total_seconds()+3599)//3600))
+            difficulty=d.get('difficulty','easy')
+            publish_at_local=now
+            deadline_local=now+timedelta(hours=24)
+            duration_hours=24
             synthetic=-(700000000000000000+(definition_id*1000000000000+user_id)%100000000000000000)
             cur.execute("""INSERT INTO biology_tasks(kind,title,chat_id,thread_id,source_message_id,payload_type,file_id,
                 text_content,deadline,xp_reward,created_by,target_scope,linked_lectures,exam_pending_activation,
-                exam_definition_id,exam_duration_hours,exam_available_at,exam_approval_required,closed,published_at,optional_practice)
-                VALUES('exam',%s,%s,0,%s,%s,%s,%s,%s,20,%s,%s,%s,FALSE,%s,%s,%s,FALSE,FALSE,%s,%s)
+                exam_definition_id,exam_duration_hours,exam_available_at,exam_approval_required,closed,published_at,optional_practice,exam_difficulty)
+                VALUES('exam',%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,%s,%s,FALSE,FALSE,%s,%s,%s)
                 ON CONFLICT (exam_definition_id,target_scope) WHERE exam_definition_id IS NOT NULL AND target_scope LIKE 'student:%%'
                 DO NOTHING RETURNING *;""",(d['title'],OWNER_CHAT_ID or d['created_by'],synthetic,media[0]['payload_type'],media[0]['file_id'],
-                d['title'],deadline_local,d['created_by'],target,','.join(f'ف{ch}/م{lec}' for ch,lec in sorted(required)),definition_id,duration_hours,publish_at_local,publish_at_local,bool(optional)))
+                d['title'],deadline_local,60 if difficulty=='hard' else 20,d['created_by'],target,','.join(f'ف{ch}/م{lec}' for ch,lec in sorted(required)),definition_id,duration_hours,publish_at_local,publish_at_local,difficulty=='hard',difficulty))
             task=cur.fetchone()
             if not task: return None
             cur.execute('INSERT INTO biology_task_students(task_id,user_id) VALUES(%s,%s) ON CONFLICT DO NOTHING;', (task['id'],user_id))
@@ -6264,7 +6308,7 @@ async def v29_ready_personal_exams():
                 JOIN biology_students s ON s.current_chapter=d.chapter AND s.study_track='chapter'
                 WHERE s.approved=TRUE AND s.reset_pending=FALSE AND s.onboarding_version>=19
                 AND d.target_scope='chapter' AND d.deleted_at IS NULL
-                AND NOT EXISTS(SELECT 1 FROM biology_tasks t WHERE t.exam_definition_id=d.id AND t.target_scope='student:'||s.user_id);""")
+                AND NOT EXISTS(SELECT 1 FROM biology_tasks t WHERE t.exam_definition_id=d.id AND t.target_scope='student:'||s.user_id::text);""")
             ready=[]
             for student in cur.fetchall():
                 required={p for p in _v47_required_lectures(cur,student['definition_id']) if not v47_before_start(student,*p)}
@@ -6339,7 +6383,8 @@ async def v47_activate_legacy_ready_exams():
                 JOIN biology_task_students ts ON ts.task_id=t.id
                 JOIN biology_students s ON s.user_id=ts.user_id
                 JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
-                WHERE t.exam_pending_activation=TRUE AND d.target_scope='chapter' AND d.deleted_at IS NULL
+                WHERE t.exam_pending_activation=TRUE AND t.exam_available_at IS NULL AND t.published_at IS NULL
+                AND d.target_scope='chapter' AND d.deleted_at IS NULL
                 AND s.approved=TRUE AND s.reset_pending=FALSE AND s.study_track='chapter' AND s.current_chapter=d.chapter
                 FOR UPDATE OF t,s;""")
             candidates=cur.fetchall();activated=[]
@@ -6364,7 +6409,7 @@ async def v47_activate_legacy_ready_exams():
 def _v48_restore_course_state(cur,user_id):
     cur.execute("""UPDATE biology_students SET schedule_mode='regular',start_chapter=NULL,start_prep_no=1,
         study_days=ARRAY[1,3,5,6],xp=COALESCE(course_xp,xp) WHERE user_id=%s;""",(user_id,))
-    cur.execute("""UPDATE biology_tasks t SET optional_practice=FALSE
+    cur.execute("""UPDATE biology_tasks t SET optional_practice=COALESCE(t.exam_difficulty='hard',FALSE)
         FROM biology_linked_exam_definitions d WHERE t.exam_definition_id=d.id
         AND d.target_scope='course' AND d.deleted_at IS NULL AND t.target_scope=%s
         AND (t.deadline>CURRENT_TIMESTAMP OR EXISTS(SELECT 1 FROM biology_task_extensions e
@@ -6538,8 +6583,7 @@ def _v48_task_track_allowed(task):
     if definition_scope=='course':
         return track=='course'
     if definition_scope=='chapter':
-        return (track=='chapter' and
-                int(task.get('definition_chapter') or 0)==int(task.get('current_chapter') or 0))
+        return track=='chapter'
     scope=str(task.get('target_scope') or '')
     if scope=='all':
         return True
@@ -6587,31 +6631,8 @@ async def v48_retire_stale_exam_obligations(cutoff_date):
 
 
 async def student_exam_lock(user_id):
-    def op():
-        with connect() as conn,conn.cursor() as cur:
-            cur.execute("""SELECT t.*,d.target_scope AS definition_scope,d.chapter AS definition_chapter,
-                    d.obligation_retired_at,st.study_track,st.current_chapter,st.start_chapter,st.start_prep_no
-                FROM biology_tasks t JOIN biology_task_students ts ON ts.task_id=t.id
-                JOIN biology_students st ON st.user_id=ts.user_id
-                LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
-                WHERE t.kind='exam' AND t.optional_practice=FALSE AND ts.user_id=%s
-                  AND (d.id IS NULL OR d.deleted_at IS NULL)
-                  AND (t.retired_obligation=FALSE OR EXISTS(SELECT 1 FROM biology_task_extensions e
-                    WHERE e.task_id=t.id AND e.user_id=ts.user_id AND e.extended_until>CURRENT_TIMESTAMP))
-                  AND (COALESCE(t.published_at,t.exam_available_at,d.created_at,t.created_at)>=(
-                    COALESCE((SELECT value::date FROM biology_settings WHERE key='v45_exam_enforcement_cutoff'),DATE '2026-09-27')
-                    AT TIME ZONE 'Asia/Baghdad') OR EXISTS(SELECT 1 FROM biology_task_extensions e
-                      WHERE e.task_id=t.id AND e.user_id=ts.user_id AND e.extended_until>CURRENT_TIMESTAMP))
-                  AND NOT EXISTS(SELECT 1 FROM biology_submissions sub WHERE sub.task_id=t.id
-                    AND sub.user_id=ts.user_id AND sub.submitted_at IS NOT NULL)
-                ORDER BY CASE WHEN t.exam_pending_activation THEN 0 WHEN t.closed THEN 1 ELSE 2 END,
-                    COALESCE(t.published_at,t.exam_available_at,t.created_at),t.id;""",(int(user_id),))
-            for task in cur.fetchall():
-                if not _v48_task_track_allowed(task): continue
-                if _v48_definition_before_start(cur,task,task.get('exam_definition_id')): continue
-                return task
-            return None
-    return await run(op)
+    """Exam debt never blocks preparation or subsequent exams."""
+    return None
 
 
 async def v28_student_exam_tasks(user_id):
@@ -7450,19 +7471,23 @@ async def v52_chapter_exam_bundle(user_id,chapter):
             cur.execute("SELECT chapter,lecture FROM biology_lecture_progress WHERE user_id=%s AND completed_at IS NOT NULL;",(int(user_id),))
             completed_pairs={(int(row['chapter']),int(row['lecture'])) for row in cur.fetchall()}
             cur.execute("""SELECT * FROM biology_linked_exam_definitions
-                WHERE chapter=%s AND deleted_at IS NULL ORDER BY created_at,id;""",(int(chapter),))
+                WHERE deleted_at IS NULL AND obligation_retired_at IS NULL
+                  AND target_scope=%s ORDER BY created_at,id;""",
+                ('course' if student.get('study_track')=='course' else 'chapter',))
             exams=[]
             for definition in cur.fetchall():
                 required=_v52_required_lectures(cur,definition['id'])
-                if not required: continue
+                if not required or not any(ch == int(chapter) for ch, _ in required): continue
                 cur.execute("""SELECT t.*,sub.submitted_at,sub.model_answer_sent_at,
-                        access.status AS approval_status
+                        access.status AS approval_status,
+                        GREATEST(t.deadline,COALESCE(ext.extended_until,t.deadline)) AS effective_deadline
                     FROM biology_tasks t
                     LEFT JOIN biology_submissions sub ON sub.task_id=t.id AND sub.user_id=%s
                     LEFT JOIN biology_exam_access access ON access.task_id=t.id AND access.user_id=%s
+                    LEFT JOIN biology_task_extensions ext ON ext.task_id=t.id AND ext.user_id=%s
                     WHERE t.exam_definition_id=%s AND t.target_scope=%s
                     ORDER BY t.id DESC LIMIT 1;""",
-                    (int(user_id),int(user_id),int(definition['id']),f"student:{int(user_id)}"))
+                    (int(user_id),int(user_id),int(user_id),int(definition['id']),f"student:{int(user_id)}"))
                 task=cur.fetchone(); ready=all((int(chp),int(ch)) in completed_pairs for chp,ch in required)
                 exams.append({**dict(definition),"required":required,"ready":ready,"task":task})
             return {"student":student,"completed":completed,"completed_pairs":completed_pairs,"exams":exams}
@@ -7477,15 +7502,26 @@ async def v52_prepare_chapter_exam(definition_id,user_id):
     exam=next((row for row in bundle['exams'] if int(row['id'])==int(definition_id)),None)
     if not exam or not exam['ready']: return {"status":"locked"}
     task=exam.get('task')
-    if not task:
-        now_holder={}
-        def now_op():
-            with connect() as conn,conn.cursor() as cur:
-                now_holder['value']=datetime_now(cur)
-        await run(now_op)
-        now=now_holder['value']
+    if not task and definition.get('target_scope')=='course':
+        window=await v47_course_window(int(definition_id))
+        if window.get('status')!='ready': return {'status':'unavailable'}
+        from datetime import datetime, timezone
+        now=datetime.now(timezone.utc)
+        if now<window['publish_at']: return {'status':'scheduled'}
+        if now>=window['deadline']: return {'status':'unavailable'}
+        task=await v29_create_or_get_exam_task(int(definition_id),int(user_id))
+    elif not task:
+        from datetime import datetime, timezone
+        now=datetime.now(timezone.utc)
         task=await _v47_create_task_atomic(int(definition_id),int(user_id),now,now+timedelta(hours=24),True)
     if not task: return {"status":"missing"}
+    status=await v45_exam_task_status(int(user_id),int(task['id']))
+    if not status or not status.get('track_allowed'): return {'status':'missing'}
+    if status.get('submitted'): return {'status':'submitted','task':task}
+    if status.get('closed') or status['effective_deadline']<=status['now']:
+        return {'status':'closed','task':task}
+    if status.get('exam_available_at') and status['exam_available_at']>status['now']:
+        return {'status':'scheduled'}
     def gate_op():
         with connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT submitted_at FROM biology_submissions WHERE task_id=%s AND user_id=%s;",(int(task['id']),int(user_id)))
@@ -7494,7 +7530,7 @@ async def v52_prepare_chapter_exam(definition_id,user_id):
             cur.execute("SELECT status FROM biology_exam_access WHERE task_id=%s AND user_id=%s;",(int(task['id']),int(user_id)))
             access=cur.fetchone(); approved=bool(access and access['status']=='approved'); notify=not bool(access)
             cur.execute("""UPDATE biology_tasks SET exam_approval_required=TRUE,
-                    exam_pending_activation=%s,closed=FALSE
+                    exam_pending_activation=%s
                 WHERE id=%s RETURNING *;""",(not approved,int(task['id'])))
             updated=cur.fetchone()
             cur.execute("""INSERT INTO biology_exam_access(task_id,user_id,status)
@@ -7868,3 +7904,14 @@ def init_db():
                          bool(replacement),student_id))
             cur.execute("DELETE FROM biology_communication_routes WHERE chat_id=%s AND role='parent';",(parent_id,))
         conn.commit()
+
+
+_reuse_previous_init_db = init_db
+def init_db():
+    _reuse_previous_init_db()
+    from school_exam_upgrade import migrate as migrate_school
+    from exam_reuse import migrate
+    migrate_school(__import__(__name__), 'biology')
+    migrate(__import__(__name__))
+    from exam_difficulty import migrate as migrate_difficulty
+    migrate_difficulty(__import__(__name__))
