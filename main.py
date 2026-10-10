@@ -75,6 +75,7 @@ PREPARATION_TOPIC_ID = _env_int("PREPARATION_TOPIC_ID")
 HOMEWORK_TOPIC_ID = _env_int("HOMEWORK_TOPIC_ID")
 EXAM_TOPIC_ID = _env_int("EXAM_TOPIC_ID")
 SCHOOL_REVIEW_TOPIC_ID = _env_int("SCHOOL_REVIEW_TOPIC_ID")
+RESOURCE_TOPIC_ID = _env_int("RESOURCE_TOPIC_ID")
 HOMEWORK_GROUP_ID = _env_int("HOMEWORK_GROUP_ID")
 EXAM_GROUP_ID = _env_int("EXAM_GROUP_ID")
 HOMEWORK_SUBMISSIONS_CHAT_ID = _env_int("HOMEWORK_SUBMISSIONS_CHAT_ID",HOMEWORK_GROUP_ID)
@@ -2869,7 +2870,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & (filters.PHOTO|filters.Document.ALL|filters.VIDEO),receive_exam_correction),group=0)
     app.add_handler(CallbackQueryHandler(button_handler,pattern=r"^(?!verify_join$).+"),group=1)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),receive_admin_communication),group=1)
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),capture_group_task),group=1)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),capture_group_task),group=3)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),private_messages),group=2)
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=False)
@@ -7867,6 +7868,24 @@ _install_school_exam_upgrade(globals(),db,'biology')
 
 from exam_difficulty import install as _install_exam_difficulty, task_is_hard
 _install_exam_difficulty(globals(),db)
+
+from admin_student_access import install as _install_admin_student_access
+_install_admin_student_access(globals(),db)
+from student_experience import install as _install_student_experience
+_install_student_experience(globals(),db)
+from education_update import install as _install_education_update
+_install_education_update(globals(),db)
+from admin_control import install as _install_admin_control
+_install_admin_control(globals(),db)
+from homework_management import install as _install_homework_management
+_install_homework_management(globals(),db,'biology')
+from prior_learning import install as _install_prior_learning
+_install_prior_learning(globals(),db,'biology')
+from school_pdf_reviews import install as _install_school_pdf_reviews
+_install_school_pdf_reviews(globals(),db,'biology')
+
+from resource_publishing import install as _install_resource_publishing
+_install_resource_publishing(globals(),db,'biology')
 
 if __name__ == "__main__":
     main()

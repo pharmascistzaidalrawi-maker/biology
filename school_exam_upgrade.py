@@ -193,3 +193,24 @@ def install(ns, db, prefix):
             except ns['TelegramError']:pass
         raise ns['ApplicationHandlerStop']
     ns['spam_guard']=spam_guard
+
+# PDF school review auto-exam feature
+# Added: 2026-10-10
+def create_pdf_review_exam_config(review_title, published_at, duration_days=2):
+    from datetime import timedelta
+    return {
+        "title": review_title,
+        "opens_at": published_at,
+        "closes_at": published_at + timedelta(days=duration_days),
+        "duration_days": duration_days,
+        "manual_closed": False,
+        "deleted": False,
+        "allow_late_with_admin": True,
+    }
+
+def update_pdf_review_exam_window(config, opens_at=None, closes_at=None):
+    if opens_at is not None:
+        config["opens_at"] = opens_at
+    if closes_at is not None:
+        config["closes_at"] = closes_at
+    return config
