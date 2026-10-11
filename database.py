@@ -2925,7 +2925,7 @@ async def v54_school_review_access(user_id):
                 FROM biology_school_review_students e
                 JOIN biology_students s ON s.user_id=e.user_id
                 WHERE e.user_id=%s AND e.active=TRUE AND s.approved=TRUE
-                  AND s.reset_pending=FALSE AND s.study_track='course';""",(int(user_id),))
+                  AND s.reset_pending=FALSE;""",(int(user_id),))
             return cur.fetchone()
     return await run(op)
 
@@ -2937,7 +2937,7 @@ async def v54_school_review_admin_students(limit=200,offset=0):
                     COALESCE(e.active,FALSE) AS school_review_enabled,e.enabled_at
                 FROM biology_students s
                 LEFT JOIN biology_school_review_students e ON e.user_id=s.user_id
-                WHERE s.approved=TRUE AND s.reset_pending=FALSE AND s.study_track='course'
+                WHERE s.approved=TRUE AND s.reset_pending=FALSE
                 ORDER BY COALESCE(e.active,FALSE) DESC,s.full_name,s.user_id
                 LIMIT %s OFFSET %s;""",(max(1,min(500,int(limit))),max(0,int(offset))))
             return cur.fetchall()
@@ -2950,7 +2950,7 @@ async def v54_toggle_school_review_student(user_id,enabled_by):
             cur.execute("""SELECT user_id,study_track,approved,reset_pending
                 FROM biology_students WHERE user_id=%s FOR UPDATE;""",(int(user_id),))
             student=cur.fetchone()
-            if not student or student['study_track']!='course' or not student['approved'] or student.get('reset_pending'):
+            if not student or not student['approved'] or student.get('reset_pending'):
                 return {'status':'not_course'}
             cur.execute("SELECT * FROM biology_school_review_students WHERE user_id=%s FOR UPDATE;",(int(user_id),))
             current=cur.fetchone(); enabled=not bool(current and current['active'])
@@ -3090,7 +3090,7 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
     cur.execute("""SELECT r.* FROM biology_school_reviews r
         JOIN biology_school_review_students e ON e.user_id=%s AND e.active=TRUE
         JOIN biology_students s ON s.user_id=e.user_id AND s.approved=TRUE
-            AND s.reset_pending=FALSE AND s.study_track='course'
+            AND s.reset_pending=FALSE
         JOIN biology_school_review_progress p ON p.review_id=r.id AND p.user_id=e.user_id
             AND p.completed_at IS NOT NULL
         WHERE r.id=%s AND r.active=TRUE
@@ -3150,7 +3150,7 @@ async def v54_complete_school_review(review_id,user_id):
             cur.execute("""SELECT r.* FROM biology_school_reviews r
                 JOIN biology_school_review_students e ON e.user_id=%s AND e.active=TRUE
                 JOIN biology_students s ON s.user_id=e.user_id AND s.approved=TRUE
-                    AND s.reset_pending=FALSE AND s.study_track='course'
+                    AND s.reset_pending=FALSE
                 WHERE r.id=%s AND r.active=TRUE AND r.published_at IS NOT NULL
                   AND r.publish_date<=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
                   
@@ -3223,7 +3223,7 @@ async def v54_enabled_school_review_students():
                 FROM biology_school_review_students e
                 JOIN biology_students s ON s.user_id=e.user_id
                 WHERE e.active=TRUE AND s.approved=TRUE AND s.reset_pending=FALSE
-                  AND s.study_track='course' ORDER BY s.user_id;""")
+                  ORDER BY s.user_id;""")
             return cur.fetchall()
     return await run(op)
 
@@ -3241,7 +3241,7 @@ async def v54_due_school_review_reminders(limit=100):
                 FROM biology_school_reviews r
                 JOIN biology_school_review_students e ON e.active=TRUE
                 JOIN biology_students s ON s.user_id=e.user_id AND s.approved=TRUE
-                    AND s.reset_pending=FALSE AND s.study_track='course'
+                    AND s.reset_pending=FALSE
                 LEFT JOIN biology_school_review_progress p ON p.review_id=r.id AND p.user_id=s.user_id
                 WHERE r.active=TRUE AND r.published_at IS NOT NULL AND p.completed_at IS NULL
                   AND r.exam_date>=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
@@ -3273,7 +3273,7 @@ async def v54_due_school_review_exams(limit=100):
                 JOIN biology_school_reviews r ON r.id=p.review_id AND r.active=TRUE
                 JOIN biology_school_review_students e ON e.user_id=p.user_id AND e.active=TRUE
                 JOIN biology_students s ON s.user_id=p.user_id AND s.approved=TRUE
-                    AND s.reset_pending=FALSE AND s.study_track='course'
+                    AND s.reset_pending=FALSE
                 WHERE p.completed_at IS NOT NULL
                   AND r.exam_deleted=FALSE AND r.exam_manual_closed=FALSE
                   AND COALESCE(r.exam_opens_at,((r.exam_date+TIME '18:00') AT TIME ZONE 'Asia/Baghdad'))<=CURRENT_TIMESTAMP
@@ -7329,11 +7329,12 @@ async def v51_admin_students():
         with connect() as conn,conn.cursor() as cur:
             cur.execute("""SELECT user_id,username,full_name,school,target_grade,approved,
                     xp,warnings,parent_chat_id,parent_full_name,parent_approved,registered_at,
-                    study_track,current_chapter,start_chapter,start_prep_no,track_started_on
+                    study_track,current_chapter,start_chapter,start_prep_no,track_started_on,admin_blocked,admin_manual_active
                 FROM biology_students WHERE reset_pending=FALSE
                 ORDER BY approved DESC,registered_at DESC,user_id;""")
             return cur.fetchall()
     return await run(op)
+
 
 
 async def v51_admin_parents():
@@ -7915,3 +7916,51 @@ def init_db():
     migrate(__import__(__name__))
     from exam_difficulty import migrate as migrate_difficulty
     migrate_difficulty(__import__(__name__))
+
+
+# Parity with the four-bot calendar: selectable 1–7 days and Baghdad dates.
+async def v60_set_study_days(user_id,days,_repair=False):
+    """Chapter students choose 1–7 weekdays; reschedule only unfinished preparations."""
+    days=sorted({int(day) for day in days})
+    def op():
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
+            if not student: return {"status":"missing"}
+            if student.get("study_track")!="chapter": return {"status":"course"}
+            if not student.get("approved") or student.get("reset_pending"): return {"status":"inactive"}
+            chapter=int(student.get("current_chapter") or 1)
+            required=len(days)
+            if not 1<=len(days)<=7 or any(day<0 or day>6 for day in days):
+                return {"status":"count","required":required}
+            cur.execute("""SELECT * FROM biology_personal_preparations
+                WHERE user_id=%s ORDER BY chapter,prep_no,target_date,id FOR UPDATE;""",(user_id,)); rows=cur.fetchall()
+            pending=[]
+            for row in rows:
+                lectures=sorted({int(x) for x in (row.get("lectures") or "").split(",") if x.strip().isdigit()})
+                if not lectures: continue
+                cur.execute("""SELECT COUNT(*) AS n FROM biology_lecture_progress
+                    WHERE user_id=%s AND chapter=%s AND lecture=ANY(%s) AND completed_at IS NOT NULL;""",
+                    (user_id,row["chapter"],lectures))
+                if int(cur.fetchone()["n"])<len(lectures): pending.append(row)
+            pending_ids=[int(row["id"]) for row in pending]
+            occupied={row["target_date"] for row in rows if int(row["id"]) not in set(pending_ids)}
+            if pending_ids:
+                cur.execute("""UPDATE biology_personal_preparations
+                    SET target_date=target_date+10000 WHERE id=ANY(%s);""",(pending_ids,))
+                from datetime import date
+                cursor=datetime.now(ZoneInfo("Asia/Baghdad")).date()-timedelta(days=1)
+                for row in pending:
+                    while True:
+                        cursor += timedelta(days=1)
+                        if cursor.weekday() in days and cursor not in occupied: break
+                    cur.execute("""UPDATE biology_personal_preparations SET target_date=%s,notified=FALSE,notified_at=NULL
+                        WHERE id=%s;""",(cursor,row["id"]))
+                    occupied.add(cursor)
+            cur.execute("""UPDATE biology_students SET schedule_mode='custom',study_days=%s,
+                schedule_change_count=COALESCE(schedule_change_count,0)+1 WHERE user_id=%s RETURNING *;""",(days,user_id)); student=cur.fetchone()
+            conn.commit(); return {"status":"ok","required":required,"student":student,"pending":len(pending)}
+    return await run(op)
+
+
+# Override historical fixed-day aliases after all older migrations.
+v41_set_study_days=v60_set_study_days

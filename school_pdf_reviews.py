@@ -59,7 +59,8 @@ def install(ns, db, prefix):
                     ADD COLUMN IF NOT EXISTS pdf_file_unique_id TEXT,
                     ADD COLUMN IF NOT EXISTS pdf_file_name TEXT,
                     ADD COLUMN IF NOT EXISTS source_chat_id BIGINT,
-                    ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
+                    ADD COLUMN IF NOT EXISTS source_message_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS source_thread_id BIGINT;
                 CREATE UNIQUE INDEX IF NOT EXISTS {prefix}_pdf_unique_file_idx
                     ON {prefix}_school_reviews(pdf_file_unique_id)
                     WHERE source_type='pdf' AND pdf_file_unique_id IS NOT NULL;
@@ -89,7 +90,7 @@ def install(ns, db, prefix):
                 return value
         return await db.run(op)
 
-    async def create_review(document, caption, actor, source_chat=None, source_message=None, published=None):
+    async def create_review(document, caption, actor, source_chat=None, source_message=None, published=None, source_thread=None):
         """One atomic publication; repeated message / Telegram unique file is idempotent."""
         if not is_pdf_document(document):
             raise ValueError('الملف يجب أن يكون PDF فقط.')
@@ -119,13 +120,14 @@ def install(ns, db, prefix):
                     (week_no,week_label,chapter_label,topics,publish_date,exam_date,
                      active,published_at,exam_opens_at,exam_closes_at,exam_manual_closed,
                      exam_deleted,source_type,pdf_file_id,pdf_file_unique_id,pdf_file_name,
-                     source_chat_id,source_message_id,group_message_id)
-                    VALUES(%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,FALSE,FALSE,'pdf',%s,%s,%s,%s,%s,%s)
+                     source_chat_id,source_message_id,group_message_id,source_thread_id)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,FALSE,'pdf',%s,%s,%s,%s,%s,%s,%s)
                     RETURNING *;''',
                     (week, f'PDF {week}', title, title, published.date(), deadline.date(),
-                     published, published, deadline, document.file_id, unique_id,
+                     source_chat is not None, published, published, deadline, document.file_id, unique_id,
                      getattr(document, 'file_name', '') or '', source_chat, source_message,
-                     source_message if source_chat == group_id else None))
+                     source_message if source_chat == group_id else None,
+                     source_thread if source_thread is not None else ns.get('SCHOOL_REVIEW_TOPIC_ID')))
                 review = cur.fetchone()
                 cur.execute(f'''INSERT INTO {prefix}_school_review_exam_media
                     (review_id,payload_type,file_id,text_content,position,created_by)
@@ -257,7 +259,7 @@ def install(ns, db, prefix):
         if not row_pdf(r):
             await query.answer('هذا الملف غير موجود.',show_alert=True); return
         count = int(r.get('media_count') or 0)
-        status = '🗑 تم حذف الامتحان' if r['exam_deleted'] else '🔒 مغلق' if r['exam_manual_closed'] or r['exam_closes_at'] <= now() else '⏳ لم يبدأ' if r['exam_opens_at'] > now() else '🟢 مفتوح'
+        status = '⏸ لم يُنشر في الموضوع' if not r['active'] else '🗑 تم حذف الامتحان' if r['exam_deleted'] else '🔒 مغلق' if r['exam_manual_closed'] or r['exam_closes_at'] <= now() else '⏳ لم يبدأ' if r['exam_opens_at'] > now() else '🟢 مفتوح'
         txt = (f"📄 {r['chapter_label']}\n"
                f"📌 الحالة: {status}\n"
                f"📅 النشر: {stamp(r['published_at'])}\n"
@@ -266,7 +268,10 @@ def install(ns, db, prefix):
                f"📎 عدد أجزاء الامتحان: {count}\n"
                '🔐 إكمال المراجعة وموافقة ولي الأمر مطلوبان حسب إعدادات البوت.')
         kb = [
+            [B('📤 إعادة إرسال الملف للتوبك',callback_data=f'pdf|retry|{rid}')] if not r['active'] else [],
             [B('📄 عرض PDF',callback_data=f'pdf|view|{rid}'),B('🔁 استبدال PDF',callback_data=f'pdf|replace|{rid}')],
+            [B('✏️ تغيير عنوان المراجعة',callback_data=f'pdf|rename|{rid}')],
+            [B('📌 نقل المراجعة إلى التوبك المحدد',callback_data=f'pdf|move|{rid}')],
             [B('🗓 تعديل البداية والنهاية',callback_data=f'sex|schedule|{rid}')],
             [B('⏳ تمديد ساعة',callback_data=f'sex|extend:1|{rid}'),B('⏳ تمديد يوم',callback_data=f'sex|extend:24|{rid}')],
             [B('⏳ تمديد مخصص',callback_data=f'pdf|custom|{rid}')],
@@ -274,7 +279,7 @@ def install(ns, db, prefix):
             [B('👥 تسليمات الطلاب',callback_data=f'pdf|students|{rid}|0'),B('📜 سجل التعديلات',callback_data=f'pdf|audit|{rid}')],
             [B('🗑 حذف الامتحان نهائياً',callback_data=f'sex|delete_confirm|{rid}')],
             [B('◀️ ملفات PDF',callback_data='pdf|list|0')]]
-        await query.edit_message_text(txt,reply_markup=K(kb))
+        await query.edit_message_text(txt,reply_markup=K([row for row in kb if row]))
 
     async def students(query, rid, page):
         page = max(0, int(page))
@@ -284,7 +289,7 @@ def install(ns, db, prefix):
             LEFT JOIN {prefix}_school_review_progress p ON p.user_id=s.user_id AND p.review_id=%s
             LEFT JOIN {prefix}_tasks t ON t.id=p.task_id
             LEFT JOIN {prefix}_submissions sub ON sub.task_id=t.id AND sub.user_id=s.user_id
-            WHERE s.approved=TRUE AND s.reset_pending=FALSE AND s.study_track='course'
+            WHERE s.approved=TRUE AND s.reset_pending=FALSE
             ORDER BY s.full_name,s.user_id LIMIT 11 OFFSET %s;''', (rid, page * 10))
         kb = []
         for r in rows[:10]:
@@ -307,10 +312,12 @@ def install(ns, db, prefix):
         kb = []
         if r['task_id'] and not r['submitted_at']:
             kb.append([B('⏳ تمديد 24 ساعة لهذا الطالب',callback_data=f'pdf|studentextend|{rid}|{uid}')])
+            kb.append([B('⏳ تمديد مخصص للطالب',callback_data=f'pdf|studentcustom|{rid}|{uid}')])
         kb.append([B('◀️ الطلاب',callback_data=f'pdf|students|{rid}|0')])
         await query.edit_message_text(text,reply_markup=K(kb))
 
-    async def extend_student(rid, uid, actor):
+    async def extend_student(rid, uid, actor, hours=24):
+        if not 1<=int(hours)<=720:raise ValueError('التمديد من ساعة إلى 720 ساعة.')
         def op():
             with db.connect() as conn,conn.cursor() as cur:
                 cur.execute(f'''SELECT t.id,t.deadline FROM {prefix}_tasks t
@@ -327,7 +334,7 @@ def install(ns, db, prefix):
                 cur.execute(f'''INSERT INTO {prefix}_task_extensions(task_id,user_id,requested_at,extended_until)
                     VALUES(%s,%s,CURRENT_TIMESTAMP,%s)
                     ON CONFLICT(task_id,user_id) DO UPDATE SET extended_until=EXCLUDED.extended_until,
-                    requested_at=CURRENT_TIMESTAMP;''', (t['id'],uid,base+timedelta(hours=24)))
+                    requested_at=CURRENT_TIMESTAMP;''', (t['id'],uid,base+timedelta(hours=hours)))
                 cur.execute(f'''UPDATE {prefix}_tasks SET closed=FALSE,
                     exam_pending_activation=FALSE,exam_approval_required=FALSE,
                     teacher_deadline_reminder_sent=FALSE WHERE id=%s;''',(t['id'],))
@@ -335,7 +342,7 @@ def install(ns, db, prefix):
                     approved_by=%s,approved_at=CURRENT_TIMESTAMP
                     WHERE task_id=%s AND user_id=%s;''',(actor,t['id'],uid))
                 cur.execute(f'''INSERT INTO {prefix}_audit(actor_id,action,details)
-                    VALUES(%s,'school_pdf_student_extended',%s);''',(actor,f'review={rid};user={uid};hours=24'))
+                    VALUES(%s,'school_pdf_student_extended',%s);''',(actor,f'review={rid};user={uid};hours={hours}'))
                 conn.commit();return True
         return await db.run(op)
 
@@ -355,7 +362,7 @@ def install(ns, db, prefix):
             FROM {prefix}_school_review_students e
             JOIN {prefix}_students s ON s.user_id=e.user_id
             WHERE e.active=TRUE AND s.approved=TRUE AND s.reset_pending=FALSE
-            AND s.study_track='course' AND NOT EXISTS(
+            AND NOT EXISTS(
               SELECT 1 FROM {prefix}_school_review_notifications n
               WHERE n.review_id=%s AND n.user_id=s.user_id AND n.kind='pdf_published')
             ORDER BY s.user_id LIMIT %s;''', (r['id'], limit))
@@ -393,13 +400,15 @@ def install(ns, db, prefix):
 
     async def pdf_job(context):
         # Includes retries for missed publication notifications after restarts.
-        reviews = await sql(f'''SELECT r.* FROM {prefix}_school_reviews r WHERE r.source_type='pdf'
+        if not ns.get('SCHOOL_REVIEW_TOPIC_ID') or not group_id:return
+        reviews = await sql(f'''SELECT r.* FROM {prefix}_school_reviews r WHERE r.source_type='pdf' AND r.source_thread_id={int(ns.get('SCHOOL_REVIEW_TOPIC_ID') or 0)}
+            AND (r.source_chat_id={group_id} OR r.group_message_id IS NOT NULL)
             AND r.active=TRUE AND r.exam_deleted=FALSE AND r.published_at IS NOT NULL
             AND r.exam_closes_at>CURRENT_TIMESTAMP
             AND EXISTS(SELECT 1 FROM {prefix}_school_review_students e
                 JOIN {prefix}_students s ON s.user_id=e.user_id
                 WHERE e.active=TRUE AND s.approved=TRUE AND s.reset_pending=FALSE
-                AND s.study_track='course' AND NOT EXISTS(
+                AND NOT EXISTS(
                   SELECT 1 FROM {prefix}_school_review_notifications n
                   WHERE n.review_id=r.id AND n.user_id=s.user_id AND n.kind='pdf_published'))
             ORDER BY r.id DESC LIMIT 10;''')
@@ -411,19 +420,20 @@ def install(ns, db, prefix):
             FROM {prefix}_school_reviews r
             JOIN {prefix}_school_review_students e ON e.active=TRUE
             JOIN {prefix}_students s ON s.user_id=e.user_id AND s.approved=TRUE
-                AND s.reset_pending=FALSE AND s.study_track='course'
+                AND s.reset_pending=FALSE
             JOIN LATERAL (
                 SELECT s.parent_chat_id AS pid WHERE s.parent_chat_id IS NOT NULL
                 UNION
                 SELECT l.parent_chat_id AS pid FROM {prefix}_parent_links l
                 WHERE l.student_id=s.user_id AND l.approved=TRUE
             ) parent ON parent.pid IS NOT NULL AND parent.pid<>s.user_id
-            WHERE r.source_type='pdf' AND r.active=TRUE AND r.exam_deleted=FALSE
+            WHERE r.source_type='pdf' AND r.source_thread_id={int(ns.get('SCHOOL_REVIEW_TOPIC_ID') or 0)}
+            AND (r.source_chat_id={group_id} OR r.group_message_id IS NOT NULL) AND r.active=TRUE AND r.exam_deleted=FALSE
               AND r.published_at IS NOT NULL AND r.exam_closes_at>CURRENT_TIMESTAMP
               AND NOT EXISTS(SELECT 1 FROM {prefix}_school_review_notifications n
                 WHERE n.review_id=r.id AND n.user_id=parent.pid
                   AND n.kind=('pdf_parent_'||s.user_id::text))
-            ORDER BY review_id DESC LIMIT 100;''')
+            ORDER BY r.id DESC LIMIT 100;''')
         for r in parent_rows:
             try:
                 await context.bot.send_message(r['parent_id'],
@@ -437,8 +447,9 @@ def install(ns, db, prefix):
                 FROM {prefix}_school_reviews r
                 JOIN {prefix}_school_review_students e ON e.active=TRUE
                 JOIN {prefix}_students s ON s.user_id=e.user_id AND s.approved=TRUE
-                    AND s.reset_pending=FALSE AND s.study_track='course'
-                WHERE r.source_type='pdf' AND r.active=TRUE AND r.exam_deleted=FALSE
+                    AND s.reset_pending=FALSE
+                WHERE r.source_type='pdf' AND r.source_thread_id={int(ns.get('SCHOOL_REVIEW_TOPIC_ID') or 0)}
+            AND (r.source_chat_id={group_id} OR r.group_message_id IS NOT NULL) AND r.active=TRUE AND r.exam_deleted=FALSE
                   AND r.exam_manual_closed=FALSE AND r.exam_closes_at>CURRENT_TIMESTAMP
                   AND r.exam_closes_at<=CURRENT_TIMESTAMP+(%s * INTERVAL '1 hour')
                   AND NOT EXISTS(SELECT 1 FROM {prefix}_school_review_notifications n
@@ -455,13 +466,14 @@ def install(ns, db, prefix):
         ended = await sql(f'''SELECT r.id,r.chapter_label,s.user_id FROM {prefix}_school_reviews r
             JOIN {prefix}_school_review_students e ON e.active=TRUE
             JOIN {prefix}_students s ON s.user_id=e.user_id AND s.approved=TRUE
-                AND s.reset_pending=FALSE AND s.study_track='course'
-            WHERE r.source_type='pdf' AND r.active=TRUE AND r.exam_deleted=FALSE
+                AND s.reset_pending=FALSE
+            WHERE r.source_type='pdf' AND r.source_thread_id={int(ns.get('SCHOOL_REVIEW_TOPIC_ID') or 0)}
+            AND (r.source_chat_id={group_id} OR r.group_message_id IS NOT NULL) AND r.active=TRUE AND r.exam_deleted=FALSE
               AND (r.exam_manual_closed=TRUE OR r.exam_closes_at<=CURRENT_TIMESTAMP)
               AND r.published_at>=CURRENT_TIMESTAMP-INTERVAL '7 days'
               AND NOT EXISTS(SELECT 1 FROM {prefix}_school_review_notifications n
                 WHERE n.review_id=r.id AND n.user_id=s.user_id AND n.kind='pdf_ended')
-            ORDER BY review_id DESC LIMIT 100;''')
+            ORDER BY r.id DESC LIMIT 100;''')
         for r in ended:
             try:
                 await context.bot.send_message(r['user_id'],f"🔒 انتهى امتحان PDF: {r['chapter_label']}")
@@ -594,6 +606,8 @@ def install(ns, db, prefix):
                     await msg.reply_text('⚠️ أرسل ملف PDF فقط، وليس صورة أو نصاً.');return
                 try:
                     if action=='new':
+                        if not ns.get('SCHOOL_REVIEW_TOPIC_ID') or not group_id:
+                            await msg.reply_text('⚠️ حدد مجموعة المدرسة ومعرّف موضوع المراجعة أولاً من لوحة الإدارة.');return
                         result=await create_review(msg.document,msg.caption,uid)
                     else:
                         ok=await replace_pdf(rid,msg.document,msg.caption,uid)
@@ -607,21 +621,43 @@ def install(ns, db, prefix):
                 context.user_data.pop('school_pdf_input',None)
                 r=result['review']
                 if result['status']=='missing':await msg.reply_text('المراجعة لم تعد موجودة.');return
-                label='تم النشر والربط' if result['status']=='created' else 'الملف موجود مسبقاً' if result['status']=='duplicate' else 'تم استبدال الملف'
+                label='تم حفظ الملف بانتظار تأكيد إرساله للتوبك' if result['status']=='created' else 'الملف موجود مسبقاً' if result['status']=='duplicate' else 'تم استبدال الملف'
                 kb=K([[B('⚙️ التحكم بالامتحان',callback_data=f"pdf|panel|{r['id']}")]])
-                await msg.reply_text(f"✅ {label}\n📄 {r['chapter_label']}\n"
+                await msg.reply_text(f"ℹ️ {label}\n📄 {r['chapter_label']}\n"
                     f"⏰ نهاية الامتحان: {stamp(r['exam_closes_at'])}",reply_markup=kb)
-                if result['status']=='created' and group_id:
+                if result['status'] in ('created','duplicate') and group_id and not r.get('active'):
                     try:
                         sent=await context.bot.send_document(group_id,msg.document.file_id,
                             caption=f"📄 مراجعة مدرسة جديدة\n{r['chapter_label']}\n"
                                     f"⏰ الامتحان ينتهي {stamp(r['exam_closes_at'])}",
                             message_thread_id=ns.get('SCHOOL_REVIEW_TOPIC_ID') or None)
-                        await sql(f'''UPDATE {prefix}_school_reviews SET group_message_id=%s
-                            WHERE id=%s AND group_message_id IS NULL;''',(sent.message_id,r['id']))
+                        await sql(f'''UPDATE {prefix}_school_reviews SET group_message_id=%s,active=TRUE,source_thread_id=%s
+                            WHERE id=%s AND group_message_id IS NULL;''',(sent.message_id,ns.get('SCHOOL_REVIEW_TOPIC_ID'),r['id']))
+                        await msg.reply_text('✅ وصل الملف لموضوع مراجعة المدرسة وتفعّل للطلاب.')
                     except TelegramError:
-                        await msg.reply_text('⚠️ تم النشر داخل البوت، لكن تعذر إرساله إلى مجموعة مراجعة المدرسة. تحقق من صلاحيات البوت ومعرّف الموضوع.')
+                        await msg.reply_text('⚠️ فشل إرسال الملف لموضوع مراجعة المدرسة، لذلك بقي غير مفعّل للطلاب. تحقق من صلاحيات البوت ومعرّف الموضوع.')
                 return
+            if action=='rename':
+                title=(msg.text or '').strip()
+                if not 3<=len(title)<=130:
+                    await msg.reply_text('أرسل عنواناً من 3 إلى 130 حرفاً.');return
+                await sql(f'''UPDATE {prefix}_school_reviews SET chapter_label=%s,topics=%s
+                    WHERE id=%s AND source_type='pdf';''',(title,title,rid))
+                await sql(f'''UPDATE {prefix}_tasks SET title=%s WHERE school_review_id=%s;''',
+                    (f'امتحان مراجعة المدرسة — {title}',rid))
+                await sql(f"INSERT INTO {prefix}_audit(actor_id,action,details) VALUES(%s,'school_pdf_renamed',%s);",
+                    (uid,f'review={rid};title={title[:50]}'))
+                context.user_data.pop('school_pdf_input',None)
+                await msg.reply_text('✅ تم تعديل عنوان المراجعة والامتحانات المرتبطة.',reply_markup=K([[B('⚙️ الامتحان',callback_data=f'pdf|panel|{rid}')]]));return
+            if action=='studentcustom':
+                try:
+                    hours=int((msg.text or '').strip())
+                    if not 1<=hours<=720:raise ValueError
+                except ValueError:
+                    await msg.reply_text('أرسل عدد ساعات من 1 إلى 720.');return
+                ok=await extend_student(rid,state['student_id'],uid,hours)
+                context.user_data.pop('school_pdf_input',None)
+                await msg.reply_text('✅ تم تمديد الطالب.' if ok else 'لم يمكن التمديد لهذا الطالب.',reply_markup=K([[B('⚙️ الامتحان',callback_data=f'pdf|panel|{rid}')]]));return
             if action=='schedule':
                 try:
                     pieces=(msg.text or '').split('|')
@@ -708,9 +744,61 @@ def install(ns, db, prefix):
             if len(parts)<3 or not parts[2].isdigit():
                 await q.answer('رابط غير صالح.',show_alert=True);return
             rid=int(parts[2])
+            if action=='move':
+                await q.answer();await q.edit_message_text('📌 تأكيد نقل المراجعة إلى موضوع المدرسة المحدد؟\nسيُعاد إرسال الملف إلى الموضوع الجديد وتحديث ارتباطه، دون حذف الرسالة القديمة.',
+                    reply_markup=K([[B('✅ تأكيد النقل',callback_data=f'pdf|moveconfirm|{rid}')],
+                                    [B('إلغاء',callback_data=f'pdf|panel|{rid}')]]));return
+            if action=='moveconfirm':
+                r=await db.v54_school_review_by_id(rid)
+                if not r or not row_pdf(r) or not r.get('pdf_file_id') or not group_id or not ns.get('SCHOOL_REVIEW_TOPIC_ID'):
+                    await q.answer('حدد المجموعة والموضوع أولاً.',show_alert=True);return
+                try:
+                    sent=await context.bot.send_document(group_id,r['pdf_file_id'],
+                        caption=f"📄 مراجعة المدرسة\n{r['chapter_label']}\n"
+                                f"⏰ ينتهي الامتحان {stamp(r['exam_closes_at'])}",
+                        message_thread_id=ns['SCHOOL_REVIEW_TOPIC_ID'])
+                    await sql(f'''UPDATE {prefix}_school_reviews SET active=TRUE,group_message_id=%s,
+                        source_thread_id=%s WHERE id=%s;''',
+                        (sent.message_id,ns['SCHOOL_REVIEW_TOPIC_ID'],rid))
+                    await sql(f"INSERT INTO {prefix}_audit(actor_id,action,details) VALUES(%s,'school_pdf_moved',%s);",
+                        (uid,f'review={rid};topic={ns["SCHOOL_REVIEW_TOPIC_ID"]}'))
+                    await q.answer('تم نقل المراجعة.');await panel(q,rid)
+                except TelegramError:
+                    logger.exception('Could not move PDF to topic')
+                    await q.answer('فشل إرسال الملف للتوبك. لم يتغير الربط.',show_alert=True)
+                return
+            if action=='retry':
+                r=await db.v54_school_review_by_id(rid)
+                if not r or not row_pdf(r) or not r.get('pdf_file_id'):
+                    await q.answer('الملف غير موجود.',show_alert=True);return
+                if r['active']:
+                    await q.answer('الملف منشور بالفعل.',show_alert=True);return
+                if not group_id or not ns.get('SCHOOL_REVIEW_TOPIC_ID'):
+                    await q.answer('حدد توبك مراجعة المدرسة أولاً.',show_alert=True);return
+                try:
+                    sent=await context.bot.send_document(group_id,r['pdf_file_id'],
+                        caption=f"📄 مراجعة مدرسة جديدة\n{r['chapter_label']}\n"
+                                f"⏰ الامتحان ينتهي {stamp(r['exam_closes_at'])}",
+                        message_thread_id=ns['SCHOOL_REVIEW_TOPIC_ID'])
+                    await sql(f'''UPDATE {prefix}_school_reviews SET active=TRUE,group_message_id=%s,
+                        source_thread_id=%s WHERE id=%s AND active=FALSE;''',
+                        (sent.message_id,ns['SCHOOL_REVIEW_TOPIC_ID'],rid))
+                    await q.answer('تم نشر الملف في الموضوع.')
+                except TelegramError:
+                    logger.exception('Retry school PDF publication failed')
+                    await q.answer('تعذر الإرسال إلى الموضوع. تحقق من الصلاحيات.',show_alert=True);return
+                await panel(q,rid);return
             if action=='panel':
                 context.user_data.pop('school_pdf_input',None)
                 await q.answer();await panel(q,rid);return
+            if action=='rename':
+                context.user_data['school_pdf_input']={'action':'rename','rid':rid,'started':time.monotonic()}
+                await q.answer();await q.edit_message_text('✏️ أرسل عنوان المراجعة الجديد في الخاص.',reply_markup=K([[B('إلغاء',callback_data=f'pdf|panel|{rid}')]]));return
+            if action=='studentcustom':
+                if len(parts)<4 or not parts[3].isdigit():
+                    await q.answer('معرف الطالب غير صالح.',show_alert=True);return
+                context.user_data['school_pdf_input']={'action':'studentcustom','rid':rid,'student_id':int(parts[3]),'started':time.monotonic()}
+                await q.answer();await q.edit_message_text('⏳ أرسل عدد ساعات التمديد لهذا الطالب (1 إلى 720).',reply_markup=K([[B('إلغاء',callback_data=f'pdf|student|{rid}|{parts[3]}')]]));return
             if action=='replace':
                 context.user_data['school_pdf_input']={'action':'replace','rid':rid,'started':time.monotonic()}
                 await q.answer();await q.edit_message_text('🔁 أرسل ملف PDF البديل في الخاص.\n'
@@ -751,7 +839,7 @@ def install(ns, db, prefix):
             if not actor or (not ns['is_admin'](actor) and not anonymous_admin):return
             try:
                 result=await create_review(msg.document,msg.caption,actor,
-                    update.effective_chat.id,msg.message_id,msg.date)
+                    update.effective_chat.id,msg.message_id,msg.date,msg.message_thread_id)
                 r=result['review']
                 status='📄 تم ربط PDF بامتحان تلقائي' if result['status']=='created' else 'ℹ️ هذا الملف مربوط بامتحان مسبقاً'
                 await msg.reply_text(f"{status}\n📚 {r['chapter_label']}\n"

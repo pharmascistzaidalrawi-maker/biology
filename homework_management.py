@@ -102,6 +102,8 @@ def install(ns,db,prefix):
         if t.get('homework_opens_at'):text+=f"\nالبداية: {t['homework_opens_at'].astimezone(ZONE):%d/%m/%Y %H:%M}"
         kb=[[B('✏️ العنوان',callback_data=f'hw|field|{tid}|title'),B('⭐ مكافأة التسليم',callback_data=f'hw|field|{tid}|xp_reward')],
             [B('🗓 وقت البداية والنهاية',callback_data=f'hw|field|{tid}|window')],
+            [B('⏳ تمديد الجميع 24 ساعة',callback_data=f'hw|extendall|{tid}|24'),B('⏳ 48 ساعة',callback_data=f'hw|extendall|{tid}|48')],
+            [B('📜 سجل التعديلات',callback_data=f'hw|audit|{tid}')],
             [B('🔒 إغلاق',callback_data=f'hw|close|{tid}'),B('🔓 فتح 24 ساعة',callback_data=f'hw|reopen|{tid}')],
             [B('👥 الطلاب والتسليمات',callback_data=f'hw|students|{tid}|0'),B('➕ إضافة طالب',callback_data=f'hw|field|{tid}|add')],
             [B('🖼 استبدال مرفق الواجب',callback_data=f'hw|field|{tid}|media')],
@@ -150,15 +152,40 @@ def install(ns,db,prefix):
                 if not r:raise ValueError('الطالب غير مكلّف بالواجب.')
                 kb=[[B(f'تمديد {h} ساعة',callback_data=f'hw|extend|{tid}|{uid}|{h}') for h in (6,24,48)],
                     [B('⭐ XP مخصص',callback_data=f'hw|field|{tid}|bonus|{uid}'),B('📊 الدرجة',callback_data=f'hw|field|{tid}|grade|{uid}')],
+                    [B('🛡 إعفاء من إنذار هذا الواجب',callback_data=f'hw|waive|{tid}|{uid}')],
                     [B('🚫 إلغاء تكليفه',callback_data=f'hw|remove|{tid}|{uid}')],back(tid)]
                 await safe_panel(q,f"👤 {r['full_name']}\nالتسليم: {'تم' if r['submitted_at'] else 'لم يسلم'}\nالدرجة: {r.get('grade')}",K(kb))
+            elif action=='extendall':
+                h=int(bits[3])
+                if h not in (24,48):raise ValueError('مدة غير صالحة.')
+                await sql(f'''UPDATE {p}_tasks SET deadline=GREATEST(deadline,CURRENT_TIMESTAMP)+(%s||' hours')::INTERVAL,
+                    closed=FALSE,homework_manual_closed=FALSE,retired_obligation=FALSE,
+                    teacher_deadline_reminder_sent=FALSE WHERE id=%s AND kind='homework';''',(h,tid),write=True)
+                await sql(f"INSERT INTO {p}_audit(actor_id,action,details) VALUES(%s,'homework_extend_all',%s);",
+                    (actor,f'task={tid};hours={h}'),write=True)
+                await panel(q,tid)
+            elif action=='audit':
+                rows=await sql(f'''SELECT actor_id,action,details,created_at FROM {p}_audit
+                    WHERE details LIKE %s ORDER BY id DESC LIMIT 15;''',(f'%task={tid}%',))
+                lines=['📜 آخر تعديلات الواجب']+[f"{r['created_at'].astimezone(ZONE):%d/%m %H:%M} | {r['action']} | {r['actor_id']}" for r in rows]
+                await safe_panel(q,'\n'.join(lines),K([back(tid)]))
+            elif action=='waive':
+                student_id=int(bits[3])
+                result=await db.v43_clear_task_warnings(tid,student_id,actor,True)
+                await q.message.reply_text(f"🛡 تم إعفاء الطالب من إنذار هذا الواجب. الإنذارات المتبقية: {result['warnings']}.")
             elif action=='extend':
                 uid,h=map(int,bits[3:5])
                 if h not in (6,24,48):raise ValueError('مدة غير صالحة.')
+                # Extension is cumulative from the later of task deadline, prior
+                # individual extension or current time. Never shorten a student's window.
                 await sql(f'''INSERT INTO {p}_task_extensions(task_id,user_id,extended_until)
-                    SELECT %s,user_id,%s FROM {p}_task_students WHERE task_id=%s AND user_id=%s
-                    ON CONFLICT(task_id,user_id) DO UPDATE SET extended_until=EXCLUDED.extended_until;''',(tid,datetime.now(ZONE)+timedelta(hours=h),tid,uid),write=True)
-                await q.message.reply_text('✅ تم التمديد للطالب. إذا كان الواجب مغلقاً يدوياً، افتحه أولاً.')
+                    SELECT %s,ts.user_id,GREATEST(t.deadline,CURRENT_TIMESTAMP,
+                        COALESCE(e.extended_until,t.deadline))+(%s||' hours')::INTERVAL
+                    FROM {p}_task_students ts JOIN {p}_tasks t ON t.id=ts.task_id
+                    LEFT JOIN {p}_task_extensions e ON e.task_id=ts.task_id AND e.user_id=ts.user_id
+                    WHERE ts.task_id=%s AND ts.user_id=%s
+                    ON CONFLICT(task_id,user_id) DO UPDATE SET extended_until=EXCLUDED.extended_until;''',(tid,h,tid,uid),write=True)
+                await q.message.reply_text('✅ تم تمديد الطالب من موعده الحالي، دون تقصير تمديد سابق. إذا كان الواجب مغلقاً يدوياً افتحه أولاً.')
             elif action=='remove':
                 token=secrets.token_hex(8);context.user_data['hw_confirm']=(token,tid,int(bits[3]),'remove')
                 await safe_panel(q,'تأكيد إلغاء تكليف الطالب؟ تبقى إجابته ونقاطه محفوظة.',K([[B('تأكيد',callback_data=f'hw|confirm|{tid}|{token}')],back(tid)]))

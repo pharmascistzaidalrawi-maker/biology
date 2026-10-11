@@ -47,6 +47,19 @@ def synchronize(cur,p,uid):
             SET completed_at=EXCLUDED.completed_at,completion_method=EXCLUDED.completion_method
             WHERE {p}_lecture_progress.completed_at IS NULL;''',
             (int(uid),METHOD,[ch for ch,n in pairs],[n for ch,n in pairs]))
+    # Earlier lessons are complete *including their royal review cycle*.
+    # No review plan or XP is generated for these inferred completions.
+    cur.execute(f"""UPDATE {p}_lecture_reviews r
+        SET completed_at=COALESCE(r.completed_at,CURRENT_TIMESTAMP),
+            reminded_at=COALESCE(r.reminded_at,CURRENT_TIMESTAMP)
+        WHERE r.user_id=%s AND (r.chapter,r.lecture)<(%s,%s);""",
+        (int(uid),*boundary))
+    # Remove stale inferred review rows if a student's start boundary moves back.
+    cur.execute(f"""DELETE FROM {p}_lecture_reviews r
+        WHERE r.user_id=%s AND (r.chapter,r.lecture)>=(%s,%s)
+        AND NOT EXISTS(SELECT 1 FROM {p}_lecture_progress lp
+          WHERE lp.user_id=r.user_id AND lp.chapter=r.chapter AND lp.lecture=r.lecture
+          AND lp.completed_at IS NOT NULL);""",(int(uid),*boundary))
 
 def install(ns,db,p):
     if p not in {'chemistry','english','mathematics','physics','biology','french','islamic'}:raise ValueError('Invalid subject')

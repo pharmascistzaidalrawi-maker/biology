@@ -121,7 +121,7 @@ def install(ns, db, prefix):
         for index, (kind, file_id) in enumerate(media):
             args = {'chat_id': group_id, 'message_thread_id': topic_id}
             if index == 0:
-                args['caption'] = f"📚 {CATEGORIES[row['category']]} | الفصل {row['chapter']}\n📄 {row['title']}"[:1024]
+                args['caption'] = f"📚 {CATEGORIES[row['category']]} | {chapter_label} {row['chapter']}\n📄 {row['title']}"[:1024]
             try:
                 if kind == 'document': await bot.send_document(document=file_id, **args)
                 elif kind == 'photo': await bot.send_photo(photo=file_id, **args)
@@ -132,9 +132,9 @@ def install(ns, db, prefix):
         return failed
 
     def chapters():
-        # The curriculum is the source of truth, not a hardcoded five-chapter assumption.
         from data import PLAYLISTS
         return sorted(int(ch) for ch in PLAYLISTS)
+    chapter_label = {'biology': 'الفصل', 'french': 'الموضوع', 'islamic': 'الوحدة'}[prefix]
 
     async def menu(q):
         rows = [[B('📚 نشر ملزمة جديدة', callback_data='respub|category|booklet')],
@@ -147,10 +147,10 @@ def install(ns, db, prefix):
             'يمكنك نشر أكثر من ملف للعنوان نفسه وحذف منشور قديم.', reply_markup=kb(rows))
 
     async def chapter_menu(q, category):
-        rows = [[B(f'📘 الفصل {ch}', callback_data=f'respub|begin|{category}|{ch}')]
+        rows = [[B(f'📘 {chapter_label} {ch}', callback_data=f'respub|begin|{category}|{ch}')]
                 for ch in chapters()]
         rows.append([back()])
-        await q.edit_message_text(f'📖 نشر {CATEGORIES[category]}\nاختر الفصل:', reply_markup=kb(rows))
+        await q.edit_message_text(f'📖 نشر {CATEGORIES[category]}\nاختر {chapter_label}:', reply_markup=kb(rows))
 
     previous_menu = ns['main_menu']
     def main_menu(admin=False):
@@ -171,13 +171,27 @@ def install(ns, db, prefix):
                 await msg.reply_text('⏳ انتهت مهلة رفع الملازم والملخصات. ابدأ منشوراً جديداً.')
                 return
             if draft['step'] == 'title':
-                title = (msg.text or '').strip()
+                title = (getattr(msg,'text',None) or getattr(msg,'caption',None) or '').strip()
+                first_media = None
+                if getattr(msg,'document',None) or getattr(msg,'photo',None) or getattr(msg,'video',None):
+                    try:
+                        first_media = extract_media(msg)
+                    except ValueError as exc:
+                        await msg.reply_text(f'⚠️ {exc}')
+                        return
+                    if not title and getattr(msg,'document',None):
+                        title = (getattr(msg.document,'file_name','') or '').rsplit('.',1)[0].strip()
                 if not title or len(title) > 140:
-                    await msg.reply_text('⚠️ أرسل اسم الملزمة أو الملخص كنص، من 1 إلى 140 حرفاً.')
+                    await msg.reply_text('⚠️ أرسل عنواناً من 1 إلى 140 حرفاً، أو ملف PDF باسم واضح أو مع تعليق.')
                     return
                 draft.update(title=title, step='media')
-                await msg.reply_text('📎 أرسل PDF أو صوراً أو فيديو، ويمكنك إرسال عدة ملفات.\n'
-                    'عند الانتهاء اضغط «إنهاء وحفظ ونشر».', reply_markup=draft_buttons())
+                if first_media:
+                    draft['media'].append(first_media)
+                    await msg.reply_text('📎 استُلم العنوان والملف الأول. أرسل ملفات إضافية أو اضغط إنهاء وحفظ ونشر.',
+                        reply_markup=draft_buttons())
+                else:
+                    await msg.reply_text('📎 أرسل PDF أو صوراً أو فيديو، ويمكنك إرسال عدة ملفات.\n'
+                        'عند الانتهاء اضغط «إنهاء وحفظ ونشر».', reply_markup=draft_buttons())
                 return
             try:
                 kind, file_id = extract_media(msg)
@@ -215,7 +229,24 @@ def install(ns, db, prefix):
                 await q.answer('افتح خاص البوت لنشر الملازم والملخصات.', show_alert=True)
                 return
             parts = data.split('|')
-            action = parts[1] if parts[0] == 'respub' and len(parts)>1 else 'beginlegacy' if parts[0]=='addresource' else 'finishlegacy'
+            # Old resourcechapter buttons use addresource|category|chapter (3 parts).
+            # Normalize them to the same atomic publishing flow as the new menu.
+            if parts[0] == 'addresource' and len(parts) == 3:
+                parts = ['respub', 'begin', parts[1], parts[2]]
+            if parts[0] == 'finishresource':
+                # Old buttons may outlive deployments; never claim success for
+                # an unfinished resource with no attachments.
+                try: resource_id = int(parts[1]) if len(parts) == 2 else 0
+                except ValueError: resource_id = 0
+                if resource_id and context.user_data.get('waiting_resource_id') == resource_id:
+                    media = await db.get_resource_media(resource_id)
+                    if not media:
+                        await q.answer('أرسل ملفاً واحداً على الأقل قبل إنهاء النشر.',show_alert=True)
+                        return
+                    return await previous_button(update,context)
+                await q.answer('هذا زر نشر قديم. افتح إدارة الملازم لبدء منشور جديد.',show_alert=True)
+                return
+            action = parts[1] if len(parts) > 1 else ''
             if action in {'menu','cancel'}:
                 context.user_data.pop('resource_publish_draft', None)
                 context.user_data.pop('resource_awaiting_title', None)
@@ -230,7 +261,7 @@ def install(ns, db, prefix):
                 try: chapter=int(ch_raw)
                 except ValueError: chapter=-1
                 if category not in CATEGORIES or chapter not in chapters():
-                    await q.answer('الفصل أو القسم غير صالح.', show_alert=True); return
+                    await q.answer('الفصل أو الموضوع أو الوحدة غير صالح.', show_alert=True); return
                 # Cancel stale admin input sessions so a later message cannot be
                 # interpreted as an unrelated exam, homework, or school PDF.
                 for stale in ('resource_awaiting_title', 'waiting_resource_id',
@@ -243,7 +274,7 @@ def install(ns, db, prefix):
                     'key': secrets.token_hex(16), 'category': category, 'chapter': chapter,
                     'title': None, 'media': [], 'step': 'title', 'started': now()}
                 await q.answer()
-                await q.edit_message_text(f'✍️ أرسل الآن اسم {CATEGORIES[category]} للفصل {chapter} في الخاص.\n'
+                await q.edit_message_text(f'✍️ أرسل الآن اسم {CATEGORIES[category]} - {chapter_label} {chapter} في الخاص.\n'
                     'يمكنك إلغاء العملية دون نشر.', reply_markup=kb([[B('❌ إلغاء', callback_data='respub|cancel')]]))
                 return
             if action in {'finish','finishlegacy'}:
@@ -262,7 +293,7 @@ def install(ns, db, prefix):
                     return
                 context.user_data.pop('resource_publish_draft', None)
                 await q.edit_message_text(f"✅ {'نُشر بنجاح' if created else 'كان محفوظاً مسبقاً'} داخل البوت\n"
-                    f"📖 {CATEGORIES[row['category']]} | الفصل {row['chapter']}\n"
+                    f"📖 {CATEGORIES[row['category']]} | {chapter_label} {row['chapter']}\n"
                     f"📄 {row['title']}\n📎 عدد الملفات: {len(draft['media'])}\n"
                     'يستطيع الطلاب الوصول إليه من قسم الملازم والملخصات.',
                     reply_markup=kb([[B('📄 فتح المنشور',callback_data=f"resourceitem|{row['id']}")],
@@ -297,7 +328,7 @@ def install(ns, db, prefix):
             if not resource:return await q.answer('الملف غير موجود.',show_alert=True)
             media=await db.get_resource_media(rid)
             await q.answer()
-            await q.edit_message_text(f"📄 {resource['title']}\n📘 الفصل {resource['chapter']}\n📎 عدد الملفات: {len(media)}",
+            await q.edit_message_text(f"📄 {resource['title']}\n📘 {chapter_label} {resource['chapter']}\n📎 عدد الملفات: {len(media)}",
                 reply_markup=kb([[B('🗑 حذف المنشور',callback_data=f'respub|deleteask|{rid}')],
                                  [B('◀️ الملفات',callback_data=f"resourcechapter|{resource['category']}|{resource['chapter']}")],
                                  [back()]]))
