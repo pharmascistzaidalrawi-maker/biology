@@ -105,7 +105,29 @@ async def edit_profile(db,uid,field,value,actor):
         with db.connect() as conn,conn.cursor() as cur:
             cur.execute('SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;',(uid,));old=cur.fetchone()
             if not old:raise ValueError('الطالب غير موجود.')
-            cur.execute(f'UPDATE biology_students SET {field}=%s WHERE user_id=%s;',(value,uid))
+            if field=='warnings':
+                # Editing the displayed counter alone used to resurrect removed
+                # warnings during the nightly ledger reconciliation.
+                wanted=int(value)
+                cur.execute('SELECT id,task_id FROM biology_warning_log WHERE user_id=%s ORDER BY created_at DESC,id DESC FOR UPDATE;',(uid,))
+                entries=cur.fetchall()
+                if wanted<len(entries):
+                    for warning in entries[:len(entries)-wanted]:
+                        if warning.get('task_id'):
+                            cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                                SELECT id,%s,%s FROM biology_tasks WHERE id=%s
+                                ON CONFLICT(task_id,user_id) DO NOTHING;""",(uid,actor,warning['task_id']))
+                        cur.execute('DELETE FROM biology_warning_log WHERE id=%s AND user_id=%s;',(warning['id'],uid))
+                elif wanted>len(entries):
+                    if wanted-len(entries)>20:
+                        raise ValueError('لا يمكن إضافة أكثر من 20 إنذاراً دفعة واحدة؛ استخدم إدارة الإنذارات.')
+                    for _ in range(wanted-len(entries)):
+                        cur.execute("""INSERT INTO biology_warning_log(user_id,task_id,reason,issued_by)
+                            VALUES(%s,NULL,'تعديل إداري لعدد الإنذارات',%s);""",(uid,actor))
+                cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
+                    WHERE user_id=%s) WHERE user_id=%s;""",(uid,uid))
+            else:
+                cur.execute(f'UPDATE biology_students SET {field}=%s WHERE user_id=%s;',(value,uid))
             if field=='xp':
                 wallet='chapter_xp' if old.get('study_track')=='chapter' else 'course_xp'
                 cur.execute(f'UPDATE biology_students SET {wallet}=%s WHERE user_id=%s;',(value,uid))

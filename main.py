@@ -1170,6 +1170,8 @@ async def activation_compliance_job(context: ContextTypes.DEFAULT_TYPE):
             if member.status in (ChatMemberStatus.LEFT,ChatMemberStatus.BANNED): await mark_member_removed(uid); continue
             try: await context.bot.send_message(uid,bold("🚫 انتهت مهلة تفعيل بوت الأحياء وربط ولي الأمر، لذلك تمت إزالتك من كروب الدورة. يمكنك التواصل مع الإدارة وإكمال التفعيل ثم العودة."),parse_mode=ParseMode.HTML)
             except TelegramError: pass
+            if not await db.v9_activation_still_due(uid):
+                continue  # Admin extended the deadline or activated the student meanwhile.
             await context.bot.ban_chat_member(BIOLOGY_GROUP_ID,uid)
             await context.bot.unban_chat_member(BIOLOGY_GROUP_ID,uid,only_if_banned=True)
             await mark_member_removed(uid)
@@ -6233,7 +6235,6 @@ async def v51_today_preparation(query):
     if not lectures:
         lines += ['','🌟 أكملت هذا التحضير بالكامل.']
         kb.append([InlineKeyboardButton('👑 المراجعة الملكية',callback_data='royal_review_menu',style='primary')])
-    kb.append([_v51_neutral_button('⚡ اختبارات المراجعة السريعة',callback_data='v48_quick_reviews')])
     kb.append([back_menu()])
     await query.edit_message_text(bold('\n'.join(lines)),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(kb))
 
@@ -6258,7 +6259,6 @@ async def v51_review_menu(query):
         kb.append([InlineKeyboardButton(
             f"📘 الفصل {chapter} | 🔥 {chapter_due} | ⏳ {len(chapter_rows)-chapter_due}",
             callback_data=f'v51_review_chapter|{chapter}',style='primary')])
-    kb.append([_v51_neutral_button('⚡ اختبارات المراجعة السريعة',callback_data='v48_quick_reviews')])
     kb.append([_v51_neutral_button(f'⚙️ عدد التحاضير اليومية: {goal}',callback_data='v51_review_goal')])
     kb.append([back_menu()])
     await query.edit_message_text(bold('\n'.join(lines)),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(kb))
@@ -6775,7 +6775,7 @@ async def v51_review_menu(query):
             lines += ['🌟 لا توجد مراجعات مستحقة.',
                 'بعد إكمال أي محاضرة ينشئ البوت مواعيد مراجعاتها الأربع تلقائيا.']
     lines += ['',f"✅ المراجعات المكتملة: {data.get('completed',0)}"]
-    rows += [[InlineKeyboardButton('⚡ اختبارات تنشيط الذاكرة',callback_data='v48_quick_reviews',style='primary')],[back_menu()]]
+    rows.append([back_menu()])
     await query.edit_message_text(bold('\n'.join(lines)),parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows))
 
@@ -6838,7 +6838,7 @@ async def v51_today_preparation(query):
         if not pending:
             lines += ['','🌟 أكملت هذه المحاضرات بالكامل.']
             rows.append([InlineKeyboardButton('⚡ إكمال المحاضرات التالية — 30 XP',callback_data='v52_unlock_next',style='success')])
-    rows += [[InlineKeyboardButton('⚡ اختبارات تنشيط الذاكرة',callback_data='v48_quick_reviews',style='primary')],[back_menu()]]
+    rows.append([back_menu()])
     await query.edit_message_text(bold('\n'.join(lines)),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -7912,6 +7912,15 @@ _install_resource_publishing(globals(),db,'biology')
 
 from biology_precision_v6 import install as _install_biology_precision_v6
 _install_biology_precision_v6(globals(),db)
+
+from admin_ui_v7 import install as _install_admin_ui_v7
+_install_admin_ui_v7(globals(),db,'biology')
+
+from admin_ui_v8 import install as _install_admin_ui_v8
+_install_admin_ui_v8(globals(),db,'biology')
+
+from admin_v9_last_additions import install as _install_admin_v9_last_additions
+_install_admin_v9_last_additions(globals(),db,'biology')
 
 if __name__ == "__main__":
     main()

@@ -1186,7 +1186,8 @@ async def due_unactivated_members():
             cur.execute("""SELECT o.*,s.approved,s.parent_chat_id,s.full_name FROM biology_observed_members o
             LEFT JOIN biology_students s ON s.user_id=o.user_id
             WHERE o.removed=FALSE AND o.activation_deadline<=CURRENT_TIMESTAMP
-            AND (s.user_id IS NULL OR s.approved=FALSE OR s.parent_chat_id IS NULL);""")
+            AND (s.user_id IS NULL OR s.approved=FALSE OR s.parent_chat_id IS NULL)
+            AND NOT (COALESCE(s.approved,FALSE) AND COALESCE(s.admin_manual_active,FALSE));""")
             return cur.fetchall()
     return await run(op)
 
@@ -2196,9 +2197,14 @@ async def buy_remove_warning(user_id):
             cur.execute("SELECT xp,warnings FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); s=cur.fetchone()
             if not s or s["warnings"]<1: return "none"
             if s["xp"]<500: return "xp"
-            cur.execute("DELETE FROM biology_warning_log WHERE id=(SELECT id FROM biology_warning_log WHERE user_id=%s ORDER BY created_at DESC LIMIT 1) RETURNING id;",(user_id,)); deleted=cur.fetchone()
+            cur.execute("DELETE FROM biology_warning_log WHERE id=(SELECT id FROM biology_warning_log WHERE user_id=%s ORDER BY created_at DESC LIMIT 1) RETURNING id,task_id;",(user_id,)); deleted=cur.fetchone()
             if not deleted: return "none"
-            cur.execute("UPDATE biology_students SET warnings=warnings-1 WHERE user_id=%s;",(user_id,))
+            if deleted.get("task_id"):
+                cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                    SELECT id,%s,0 FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
+                    (user_id,deleted["task_id"]))
+            cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
+                WHERE user_id=%s) WHERE user_id=%s;""",(user_id,user_id))
             _set_xp_event(cur,user_id,-500,"فك إنذار واحد",f"unwarn-purchase:{user_id}:{deleted['id']}")
             conn.commit(); return "ok"
     return await run(op)
@@ -2429,6 +2435,10 @@ async def add_warning(user_id,reason,issued_by=0,task_id=None):
                 if exam and exam.get('exam_difficulty')=='hard':
                     cur.execute("SELECT warnings FROM biology_students WHERE user_id=%s;",(user_id,))
                     student=cur.fetchone(); return student['warnings'] if student else 0
+            if task_id and int(issued_by or 0)==0:
+                cur.execute("SELECT 1 FROM biology_v9_deleted_task_warnings WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
+                if cur.fetchone():
+                    return student["warnings"]
             if task_id:
                 cur.execute("SELECT 1 FROM biology_warning_log WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
                 if cur.fetchone():
@@ -2463,6 +2473,9 @@ async def add_warning_once(user_id,reason,issued_by=0,task_id=None):
                     AND NOT EXISTS(SELECT 1 FROM biology_leave_requests lr WHERE lr.user_id=%s AND lr.leave_date=t.deadline::date AND lr.status='approved')
                     FOR UPDATE OF t;""",(user_id,user_id,task_id,user_id,user_id,user_id))
                 if not cur.fetchone(): return {"count":student['warnings'],"created":False}
+            if task_id and int(issued_by or 0)==0:
+                cur.execute("SELECT 1 FROM biology_v9_deleted_task_warnings WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
+                if cur.fetchone(): return {"count":student["warnings"],"created":False}
             if task_id:
                 cur.execute("SELECT 1 FROM biology_warning_log WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
                 if cur.fetchone(): return {"count":student["warnings"],"created":False}
@@ -2479,9 +2492,14 @@ async def remove_warning(user_id,removed_by,warning_id=None):
             if selected_warning_id is None:
                 cur.execute("SELECT id FROM biology_warning_log WHERE user_id=%s ORDER BY created_at DESC LIMIT 1;",(user_id,)); target=cur.fetchone(); selected_warning_id=target["id"] if target else None
             if selected_warning_id is None: return None
-            cur.execute("DELETE FROM biology_warning_log WHERE id=%s AND user_id=%s RETURNING id;",(selected_warning_id,user_id)); deleted=cur.fetchone()
+            cur.execute("DELETE FROM biology_warning_log WHERE id=%s AND user_id=%s RETURNING id,task_id;",(selected_warning_id,user_id)); deleted=cur.fetchone()
             if not deleted: return None
-            cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-1) WHERE user_id=%s RETURNING warnings;",(user_id,)); row=cur.fetchone()
+            if deleted.get("task_id"):
+                cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                    SELECT id,%s,%s FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
+                    (user_id,removed_by,deleted["task_id"]))
+            cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
+                WHERE user_id=%s) WHERE user_id=%s RETURNING warnings;""",(user_id,user_id)); row=cur.fetchone()
             cur.execute("INSERT INTO biology_audit(actor_id,action,details) VALUES(%s,'remove_warning',%s);",(removed_by,f"{user_id}:{selected_warning_id}")); conn.commit(); return row["warnings"] if row else 0
     return await run(op)
 
@@ -3897,6 +3915,9 @@ async def v43_clear_task_warnings(task_id,user_id,admin_id=0,waive=False):
             if removed:
                 cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-%s) WHERE user_id=%s;",(removed,int(user_id)))
             if waive:
+                cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                    SELECT id,%s,%s FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
+                    (int(user_id),int(admin_id or 0),int(task_id)))
                 cur.execute("""INSERT INTO biology_exam_warning_waivers(task_id,user_id,waived_by)
                     VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO UPDATE SET
                     waived_by=EXCLUDED.waived_by,created_at=CURRENT_TIMESTAMP;""",(int(task_id),int(user_id),int(admin_id or 0)))
@@ -4021,6 +4042,9 @@ async def v43_clear_exam_definition_warnings(definition_id,admin_id):
                 JOIN biology_students s ON s.user_id=ts.user_id
                 WHERE t.exam_definition_id=%s AND t.kind='exam';""",(int(definition_id),)); students=cur.fetchall(); removed_total=0
             for item in students:
+                cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                    VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO NOTHING;""",
+                    (item["task_id"],item["user_id"],int(admin_id)))
                 cur.execute("DELETE FROM biology_warning_log WHERE task_id=%s AND user_id=%s RETURNING id;",(item["task_id"],item["user_id"])); removed=len(cur.fetchall()); removed_total+=removed
                 if removed: cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-%s) WHERE user_id=%s;",(removed,item["user_id"]))
                 item["warnings_removed"]=removed
@@ -4061,9 +4085,14 @@ async def v43_remove_warning(user_id,warning_id,admin_id):
                 LEFT JOIN biology_tasks t ON t.id=w.task_id
                 WHERE w.id=%s AND w.user_id=%s FOR UPDATE OF w;""",(int(warning_id),int(user_id))); warning=cur.fetchone()
             if not warning: return {"status":"not_found"}
+            if warning.get("task_id"):
+                cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                    SELECT id,%s,%s FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
+                    (int(user_id),int(admin_id),warning["task_id"]))
             cur.execute("DELETE FROM biology_warning_log WHERE id=%s;",(int(warning_id),))
-            cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-1) WHERE user_id=%s RETURNING warnings,full_name;",(int(user_id),)); student=cur.fetchone()
-            if warning.get("task_id") and warning.get("kind")=="exam":
+            cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
+                WHERE user_id=%s) WHERE user_id=%s RETURNING warnings,full_name;""",(int(user_id),int(user_id))); student=cur.fetchone()
+            if warning.get("task_id") and warning.get("kind") in ("exam","homework"):
                 cur.execute("""INSERT INTO biology_exam_warning_waivers(task_id,user_id,waived_by)
                     VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO UPDATE SET
                     waived_by=EXCLUDED.waived_by,created_at=CURRENT_TIMESTAMP;""",(warning["task_id"],int(user_id),int(admin_id)))

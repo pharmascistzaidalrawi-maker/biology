@@ -41,7 +41,7 @@ def draft_expired(draft, now):
 
 
 def install(ns, db, prefix):
-    if prefix not in {'biology', 'french', 'islamic'}:
+    if prefix not in {'biology', 'english', 'french', 'islamic'}:
         raise ValueError('Unknown subject')
     B, K = ns['InlineKeyboardButton'], ns['InlineKeyboardMarkup']
     zone = ns['TIMEZONE']
@@ -60,6 +60,7 @@ def install(ns, db, prefix):
         with db.connect() as conn, conn.cursor() as cur:
             cur.execute(f'''ALTER TABLE {prefix}_resources
                 ADD COLUMN IF NOT EXISTS publication_key TEXT;
+                ALTER TABLE {prefix}_resources ALTER COLUMN prep_no SET DEFAULT 0;
                 CREATE UNIQUE INDEX IF NOT EXISTS {prefix}_resource_publication_key_idx
                 ON {prefix}_resources(publication_key) WHERE publication_key IS NOT NULL;''')
             conn.commit()
@@ -80,8 +81,8 @@ def install(ns, db, prefix):
         def op():
             with db.connect() as conn, conn.cursor() as cur:
                 cur.execute(f'''INSERT INTO {prefix}_resources
-                    (category,chapter,title,created_by,publication_key)
-                    VALUES(%s,%s,%s,%s,%s)
+                    (category,chapter,prep_no,title,created_by,publication_key)
+                    VALUES(%s,%s,0,%s,%s,%s)
                     ON CONFLICT DO NOTHING RETURNING *;''',
                     (draft['category'], draft['chapter'], draft['title'], int(actor), draft['key']))
                 row = cur.fetchone()
@@ -134,15 +135,17 @@ def install(ns, db, prefix):
     def chapters():
         from data import PLAYLISTS
         return sorted(int(ch) for ch in PLAYLISTS)
-    chapter_label = {'biology': 'الفصل', 'french': 'الموضوع', 'islamic': 'الوحدة'}[prefix]
+    chapter_label = {'biology': 'الفصل', 'english': 'اليونت', 'french': 'الموضوع', 'islamic': 'الوحدة'}[prefix]
 
     async def menu(q):
         rows = [[B('📚 نشر ملزمة جديدة', callback_data='respub|category|booklet')],
                 [B('📝 نشر ملخص جديد', callback_data='respub|category|summary')],
+                [B('🏛 نشر أسئلة وزارية', callback_data='respub|category|ministerial')],
                 [B('📚 تصفح الملازم المنشورة', callback_data='resourcecategory|booklet')],
                 [B('📝 تصفح الملخصات المنشورة', callback_data='resourcecategory|summary')],
+                [B('🏛 تصفح الأسئلة الوزارية', callback_data='resourcecategory|ministerial')],
                 [B('🏠 القائمة الرئيسية', callback_data='menu')]]
-        await q.edit_message_text('📖 إدارة الملازم والملخصات\n'
+        await q.edit_message_text('📖 الملازم والملخصات والأسئلة الوزارية\n'
             'ارفع PDF أو صوراً من خاص البوت؛ لا يظهر المنشور للطلاب حتى تضغط إنهاء وحفظ.\n'
             'يمكنك نشر أكثر من ملف للعنوان نفسه وحذف منشور قديم.', reply_markup=kb(rows))
 

@@ -456,11 +456,13 @@ def install(ns,db):
         rows += [[B(('🎧 مستمع بلا عقوبات' if f.get('listener') else '⚠️ طالب ملتزم بالعقوبات'),callback_data=f'bio6|toggle|{uid}|listener')],
                  [B('👁 إدارة ملف الطالب',callback_data=f'admin_student|{uid}')],
                  [B('◀️ الإدارة',callback_data='bio6|hub')]]
-        await q.edit_message_text(f"👤 {student.get('full_name') or uid}\n🆔 {uid}\n━━━━━━━━━━━━━━━━━━\n🟢 مفعّل / 🔴 معطّل\nالطالب يُحاسب فقط على الأقسام المفعّلة.\nالمستمع يمكنه الاطلاع دون إنذارات أو طرد آلي.",reply_markup=K(rows))
+        await q.edit_message_text(f"👤 {student.get('full_name') or uid}\n🆔 {uid}\n🔑 كود ولي الأمر: {student.get('parent_link_code') or 'غير متوفر'}\n━━━━━━━━━━━━━━━━━━\n🟢 مفعّل / 🔴 معطّل\nالطالب يُحاسب فقط على الأقسام المفعّلة.\nالمستمع يمكنه الاطلاع دون إنذارات أو طرد آلي.",reply_markup=K(rows))
     async def lead_panel(q,uid):
         r=await sql('SELECT * FROM biology_start_leads WHERE user_id=%s;',(uid,),True)
         if not r:await q.answer('الطلب غير موجود.',show_alert=True);return
-        await q.edit_message_text(f"🆕 طلب بدء البوت\n👤 {r['display_name']}\n🆔 {uid}\n@{r['username'] or '-'}\nيمكن تسجيل الطالب وتفعيله مباشرة، ويختار مساره عند فتح البوت.",reply_markup=K([
+        code, active = await db.v7_ensure_parent_code(uid)
+        status = 'جاهز' if active else 'يصبح قابلاً للربط بعد تسجيل الطالب'
+        await q.edit_message_text(f"🆕 طلب بدء البوت\n👤 {r['display_name']}\n🆔 {uid}\n@{r['username'] or '-'}\n🔑 كود ولي الأمر: {code}\n{status}\nيمكن تسجيل الطالب وتفعيله مباشرة، ويختار مساره عند فتح البوت.",reply_markup=K([
             [B('✅ تسجيل وتفعيل',callback_data=f'bio6|activate|{uid}',style='success')],
             [B('◀️ طلبات Start',callback_data='bio6|leads|0')]]))
     async def lead_list(q,page):
@@ -496,8 +498,10 @@ def install(ns,db):
                 lead=await record_lead(user)
                 # Only first start sends an admin notification; repeated starts refresh the lead.
                 if lead['first_seen_at']==lead['last_seen_at']:
+                    parent_code, code_active = await db.v7_ensure_parent_code(user.id)
+                    code_status = 'جاهز' if code_active else 'يُفعّل بعد التسجيل'
                     for aid in {int(v) for v in (ns.get('ADMIN_IDS') or set())| (ns.get('FOUNDER_IDS') or set()) if int(v)>0}|({int(ns.get('OWNER_CHAT_ID'))} if ns.get('OWNER_CHAT_ID') else set()):
-                        try:await context.bot.send_message(aid,f"🆕 طالب ضغط Start\n👤 {user.full_name}\n🆔 {user.id}",reply_markup=K([[B('⚙️ تسجيل من الإدارة',callback_data=f'bio6|lead|{user.id}')]]))
+                        try:await context.bot.send_message(aid,f"🆕 طالب ضغط Start\n👤 {user.full_name}\n🆔 {user.id}\n🔑 كود ولي الأمر: {parent_code}\nحالة الكود: {code_status}",reply_markup=K([[B('⚙️ تسجيل من الإدارة',callback_data=f'bio6|lead|{user.id}')]]))
                         except ns['TelegramError']:LOG.warning('Could not notify admin %s of /start',aid)
         return await old_start(update,context)
     ns['start']=start
