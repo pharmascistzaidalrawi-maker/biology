@@ -184,42 +184,10 @@ def install(ns, db, subject):
     db.register_student = register_student
     ns['register_student'] = register_student
 
-    # /start notifications for registered students (new leads are notified by
-    # the precision-v6 start handler, which uses the reserved code above).
+    # Student /start notices are now handled only by start_role_routing.py,
+    # and are delivered exclusively to the activation group. No private alerts.
     old_start = ns['start']
     async def start(update, context):
-        user = update.effective_user
-        if user and not is_admin(user.id):
-            student = await db.get_student(user.id)
-            if student and student.get('approved'):
-                code = student.get('parent_link_code')
-                if code:
-                    def notice_due():
-                        with db.connect() as conn, conn.cursor() as cur:
-                            cur.execute(f'''INSERT INTO {subject}_v7_start_notices(user_id)
-                                VALUES(%s) ON CONFLICT(user_id) DO UPDATE SET
-                                last_sent_at=CURRENT_TIMESTAMP
-                                WHERE {subject}_v7_start_notices.last_sent_at<CURRENT_TIMESTAMP-INTERVAL '6 hours'
-                                RETURNING user_id;''', (user.id,))
-                            result = bool(cur.fetchone())
-                            conn.commit()
-                            return result
-                    if await db.run(notice_due):
-                        admin_ids = set(ns.get('ADMIN_IDS') or ()) | set(ns.get('FOUNDER_IDS') or ())
-                        owner = ns.get('OWNER_CHAT_ID')
-                        if owner:
-                            admin_ids.add(int(owner))
-                        for aid in admin_ids:
-                            try:
-                                await context.bot.send_message(int(aid),
-                                    f'👤 الطالب ضغط Start في بوت {label}\n'
-                                    f'الاسم: {student.get("full_name") or user.full_name}\n'
-                                    f'ID: {user.id}\n'
-                                    f'🔑 كود ولي الأمر: {code}\n'
-                                    f'/parent {code}',
-                                    reply_markup=kb([[b('👤 إدارة الطالب', f'bio6|student|{user.id}')]]))
-                            except ns['TelegramError']:
-                                LOG.warning('Admin /start notification failed: %s', aid)
         return await old_start(update, context)
     ns['start'] = start
 

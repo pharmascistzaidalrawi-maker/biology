@@ -64,10 +64,9 @@ async def release_activation(db,uid):
     await db.run(op)
 
 def activation_destinations(ns):
-    admins=set(ns.get('ADMIN_IDS') or ())|set(ns.get('FOUNDER_IDS') or ())
-    if ns.get('OWNER_CHAT_ID'):admins.add(ns['OWNER_CHAT_ID'])
+    """Activation requests belong in the activation group, never admin DMs."""
     group=int(ns.get('ACTIVATION_GROUP_ID') or 0)
-    return sorted(({group} if group else set())|{int(x) for x in admins if int(x)>0})
+    return [group] if group < 0 else []
 
 class PreviewQuery:
     """Render a real student's read views into the administrator's original chat."""
@@ -121,7 +120,7 @@ def install(ns,db):
         sent=sum(await asyncio.gather(*(deliver(chat) for chat in destinations)))
         if not sent:await release_activation(db,uid)
         try:
-            await bot.send_message(uid,'⏳ طلب تفعيلك محفوظ بانتظار موافقة الإدارة. يمكنك إعادة إرساله من الزر أدناه.',reply_markup=pending_menu(student))
+            await bot.send_message(uid,('⏳ تم إرسال طلب تفعيلك إلى مجموعة التفعيل. يمكنك إعادة إرساله من الزر أدناه.' if sent else '⚠️ تعذر إيصال طلبك إلى مجموعة التفعيل. أخبر الإدارة أو حاول مجدداً.'),reply_markup=pending_menu(student))
         except ns['TelegramError']:
             ns['logger'].warning('Student activation status notice failed for %s',uid)
         return {'status':'sent' if sent else 'failed','sent':sent,'total':len(destinations)}

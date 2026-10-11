@@ -352,6 +352,9 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_activation_request(bot,student):
     buttons=InlineKeyboardMarkup([[InlineKeyboardButton("✅ قبول وتفعيل",callback_data=f"approve|{student['user_id']}"),InlineKeyboardButton("❌ رفض",callback_data=f"reject|{student['user_id']}")]])
     text=bold(f"🔔 طلب تفعيل مكتمل\n\n👤 {student['full_name']}\n🆔 {student['user_id']}\n🏫 {student['school']}\n🎯 {student['target_grade']}\n👨‍👩‍👦 ولي الأمر: {student['parent_chat_id']}")
+    if ACTIVATION_GROUP_ID >= 0:
+        logger.error('ACTIVATION_GROUP_ID must be a negative Telegram group ID; activation request not sent')
+        return
     await bot.send_message(ACTIVATION_GROUP_ID,text,parse_mode=ParseMode.HTML,reply_markup=buttons)
 
 
@@ -2836,9 +2839,9 @@ def main():
     threading.Thread(target=health_server,daemon=True).start()
     app=Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).post_init(post_init).post_shutdown(post_shutdown).build()
     registration=ConversationHandler(
-        entry_points=[CommandHandler("start",start), CallbackQueryHandler(parent_restart_registration,pattern="^parent_restart$"), CallbackQueryHandler(v47_reset_confirm,pattern="^v47_reset_confirm$")],
+        entry_points=[CommandHandler("start",start), CallbackQueryHandler(role_choice_entry,pattern=r"^start_role\|(student|parent)$"), CallbackQueryHandler(parent_restart_registration,pattern="^parent_restart$"), CallbackQueryHandler(v47_reset_confirm,pattern="^v47_reset_confirm$")],
         states={REG_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,reg_name)],REG_SCHOOL:[MessageHandler(filters.TEXT & ~filters.COMMAND,reg_school)],REG_GRADE:[MessageHandler(filters.TEXT & ~filters.COMMAND,reg_grade)],REG_JOIN:[CallbackQueryHandler(verify_join,pattern="^verify_join$")]},
-        fallbacks=[CommandHandler("start",start),CommandHandler("parent",parent_during_registration),CommandHandler("cancel",cancel_registration)],allow_reentry=True,conversation_timeout=1800,
+        fallbacks=[CommandHandler("start",start), CallbackQueryHandler(role_choice_entry,pattern=r"^start_role\|(student|parent)$"),CommandHandler("parent",parent_during_registration),CommandHandler("cancel",cancel_registration)],allow_reentry=True,conversation_timeout=1800,
     )
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE,spam_guard),group=-1)
     app.add_handler(CallbackQueryHandler(spam_guard),group=-1)
@@ -7921,6 +7924,9 @@ _install_admin_ui_v8(globals(),db,'biology')
 
 from admin_v9_last_additions import install as _install_admin_v9_last_additions
 _install_admin_v9_last_additions(globals(),db,'biology')
+
+from start_role_routing import install as _install_start_role_routing
+_install_start_role_routing(globals(), db, 'biology')
 
 if __name__ == "__main__":
     main()

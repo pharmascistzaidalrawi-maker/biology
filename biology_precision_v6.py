@@ -493,16 +493,12 @@ def install(ns,db):
         user=update.effective_user
         if user and not is_admin(user.id):
             scope_cache[user.id]=await flags(user.id)
-            student=await db.get_student(user.id)
-            if not student or not student.get('approved'):
-                lead=await record_lead(user)
-                # Only first start sends an admin notification; repeated starts refresh the lead.
-                if lead['first_seen_at']==lead['last_seen_at']:
-                    parent_code, code_active = await db.v7_ensure_parent_code(user.id)
-                    code_status = 'جاهز' if code_active else 'يُفعّل بعد التسجيل'
-                    for aid in {int(v) for v in (ns.get('ADMIN_IDS') or set())| (ns.get('FOUNDER_IDS') or set()) if int(v)>0}|({int(ns.get('OWNER_CHAT_ID'))} if ns.get('OWNER_CHAT_ID') else set()):
-                        try:await context.bot.send_message(aid,f"🆕 طالب ضغط Start\n👤 {user.full_name}\n🆔 {user.id}\n🔑 كود ولي الأمر: {parent_code}\nحالة الكود: {code_status}",reply_markup=K([[B('⚙️ تسجيل من الإدارة',callback_data=f'bio6|lead|{user.id}')]]))
-                        except ns['TelegramError']:LOG.warning('Could not notify admin %s of /start',aid)
+            # Only student accounts are recorded as enrollment leads. Parents
+            # must not appear as new students or trigger private admin alerts.
+            if not await db.students_by_parent(user.id, False):
+                student=await db.get_student(user.id)
+                if not student or not student.get('approved'):
+                    await record_lead(user)
         return await old_start(update,context)
     ns['start']=start
 
