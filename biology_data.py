@@ -33,3 +33,16 @@ CHAPTER_PREPARATION_DISTRIBUTION = {chapter: [[index] for index in range(1,len(l
                                    for chapter,lectures in PLAYLISTS.items()}
 PREPARATIONS = {}
 NEXT_PREPARATIONS = []
+
+# Stable IDs: keep the existing 39 genetics lectures unchanged.
+# Foundations are displayed as 1..7 but stored as chapter 5 lectures 40..46.
+GENETICS_FOUNDATIONS = [
+    (1, 'https://www.youtube.com/watch?v=Cs3B3KhRPpw'),
+    (2, 'https://youtu.be/DF4hKmY9b7Q?si=O-s23a3L07Q8mD91'),
+    (3, 'https://youtu.be/88k88tLPxtw'),
+    (4, 'https://youtu.be/h9ha_HkEQa4'),
+    (5, 'https://youtu.be/nVs2TmUaVIY'),
+    (6, 'https://youtu.be/GwbHdIzzQGU'),
+    (7, 'https://youtu.be/tf2o4EqT1Lg'),
+]
+PLAYLISTS[5].extend((39+n, f'أساسيات الوراثة — المحاضرة {n}', url) for n,url in GENETICS_FOUNDATIONS)

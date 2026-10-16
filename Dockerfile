@@ -6,5 +6,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-co
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN python -m compileall -q .
+RUN python -m compileall -q . && python -c "import main"
 CMD ["python", "main.py"]

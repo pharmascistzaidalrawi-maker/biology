@@ -100,7 +100,7 @@ _OWNER_ERROR_ALERT_AT=0.0
 
 REG_NAME, REG_SCHOOL, REG_GRADE, REG_JOIN = range(4)
 DIV = "━━━━━━━━━━━━━━━━━━"
-BUILD_VERSION = "biology-precision-v6-20261011"
+BUILD_VERSION = "biology-v13.1-genetics-link2-20261016"
 NEON_ECO_MODE=_env_bool("NEON_ECO_MODE",True)
 NEON_ECO_INTERVAL_SECONDS=max(900,_env_int("NEON_ECO_INTERVAL_SECONDS",1800))
 NEON_BACKGROUND_INTERVAL_SECONDS=max(3600,_env_int("NEON_BACKGROUND_INTERVAL_SECONDS",21600))
@@ -534,7 +534,7 @@ async def show_tasks(query,kind,category=None):
         visible=[]; now=datetime.now(TIMEZONE)
         for row in rows:
             effective=await effective_task_deadline(row["id"],query.from_user.id)
-            if effective and (now<effective["deadline"] or (row["kind"]=="exam" and row.get("closed") and not effective.get("submitted"))): visible.append(row)
+            if effective and (now<effective["deadline"] or (row["kind"]=="exam" and row.get("closed") and not (effective or {}).get("submitted"))): visible.append(row)
         rows=visible
     if not rows and kind=="exam" and not is_admin(query.from_user.id):
         # Explain an incomplete linked exam instead of making the student think the bot is broken.
@@ -564,7 +564,7 @@ async def show_task(query,context,task_id):
     effective=None
     if not is_admin(query.from_user.id):
         effective=await effective_task_deadline(task_id,query.from_user.id)
-        late_exam = task["kind"]=="exam" and task.get("closed") and not effective.get("submitted")
+        late_exam = task["kind"]=="exam" and task.get("closed") and not (effective or {}).get("submitted")
         if (not effective or not effective.get("assigned") or (datetime.now(TIMEZONE)>=effective["deadline"] and not late_exam)):
             await query.answer("⏰ انتهى وقت هذا الامتحان أو الواجب.",show_alert=True); return
     if task["kind"]=="exam" and task.get("exam_approval_required") and not is_admin(query.from_user.id):
@@ -599,22 +599,14 @@ async def notify_student_and_parent(bot,student,text):
 
 
 async def ensure_student_topic(bot,student,chat_id):
-    thread_id=await student_topic(student["user_id"],chat_id)
-    if thread_id: return thread_id
-    name=f"{student['full_name']} | {student['user_id']}"[:128]
-    try:
-        topic=await bot.create_forum_topic(chat_id,name)
-        await save_student_topic(student["user_id"],chat_id,topic.message_thread_id)
-        return topic.message_thread_id
-    except TelegramError as exc:
-        logger.warning("Could not create student topic in %s: %s",chat_id,exc); return None
+    return await _submission_topic_router.ensure(bot,student,chat_id)
 
 
 async def receive_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id=context.user_data.get("waiting_submission")
     if not task_id: return False
     student=await get_student(update.effective_user.id)
-    if not student or not student["approved"] or (not student.get("parent_chat_id") and not await db.bio6_listener(update.effective_user.id)) or not await is_channel_member(context.bot,update.effective_user.id):
+    if not student or not student["approved"] or (not student.get("parent_chat_id") and not student.get("admin_manual_active") and not await db.bio6_listener(update.effective_user.id)) or not await is_channel_member(context.bot,update.effective_user.id):
         context.user_data.pop("waiting_submission",None); await update.effective_message.reply_text(bold("🔒 لا يمكنك التسليم: يجب تفعيل الحساب وربط ولي الأمر والاشتراك بالقناة."),parse_mode=ParseMode.HTML); return True
     task=await get_task(task_id)
     effective=await effective_task_deadline(task_id,update.effective_user.id) if task else None
@@ -685,7 +677,7 @@ async def receive_submission(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("waiting_submission",None)
         confirm_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ لا، إجاباتي صحيحة",callback_data=f"submissionok|{task_id}"),InlineKeyboardButton("🔄 نعم، أريد تغييرها",callback_data=f"retrysubmission|{task_id}")],
             [InlineKeyboardButton("🎬 فتح المحاضرات التالية",callback_data="today_prep")]])
-        await msg.reply_text(bold(f"✅ تم تسجيل وإرسال الحل للأستاذ بنجاح.\n⭐ {'أضيفت نقاط المهمة إلى حسابك.' if result=='added' else 'تم استبدال تسليمك السابق.'}\n\nهل تود تغيير الإجابات لوجود خطأ في الصورة؟\nيمكنك تغييرها مرتين فقط لكل امتحان أو واجب.\n\n📚 إذا كان هذا الامتحان حاجزًا أمام المحاضرات التالية، فسيُرفع الحظر تلقائيًا بعد تسجيل التسليم."),parse_mode=ParseMode.HTML,reply_markup=confirm_kb)
+        await msg.reply_text(bold(f"✅ تم تسجيل وإرسال الحل للأستاذ بنجاح.\n⭐ {'أضيفت نقاط المهمة إلى حسابك.' if result=='added' else 'تم استبدال تسليمك السابق.'}\n\nهل تود تغيير الإجابات لوجود خطأ في الصورة؟\nيمكنك تغييرها مرة واحدة فقط لكل امتحان أو واجب.\n\n📚 إذا كان هذا الامتحان حاجزًا أمام المحاضرات التالية، فسيُرفع الحظر تلقائيًا بعد تسجيل التسليم."),parse_mode=ParseMode.HTML,reply_markup=confirm_kb)
     return True
 
 
@@ -718,8 +710,8 @@ async def receive_grade_value(update: Update,context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(bold("⚠️ تعذر حفظ الدرجة."),parse_mode=ParseMode.HTML); raise ApplicationHandlerStop
     if state.get("file_id"):
         await save_exam_correction(ref["task_id"],ref["user_id"],state["payload_type"],state["file_id"],grade,update.effective_user.id)
-    if ref["kind"]=="exam" and grade<60 and not await db.bio6_listener(ref["user_id"]) and not await task_is_hard(db,ref["task_id"]):
-        count=await add_warning(ref["user_id"],f"رسوب في {ref['title']} بدرجة {grade}",update.effective_user.id,ref["task_id"])
+    if ref["kind"]=="exam" and grade<80:
+        count=(await get_student(ref["user_id"]))["warnings"]
         await notify_student_and_parent(context.bot,ref,f"⚠️ إنذار رسوب ({count}/{MAX_WARNINGS})\nالدرجة: {grade}/100 في {ref['title']}")
     caption=bold(f"📄 تصحيح {'الامتحان' if ref['kind']=='exam' else 'الواجب'}\n👤 الطالب: {ref['full_name']}\n📌 {ref['title']}\n📊 الدرجة: {grade}/100")
     delivered=[]
@@ -828,7 +820,7 @@ async def finalize_album_submission(context: ContextTypes.DEFAULT_TYPE):
     task_id=state["task_id"]
     confirm_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ لا، إجاباتي صحيحة",callback_data=f"submissionok|{task_id}"),InlineKeyboardButton("🔄 نعم، أريد تغييرها",callback_data=f"retrysubmission|{task_id}")],
         [InlineKeyboardButton("🎬 فتح المحاضرات التالية",callback_data="today_prep")]])
-    try: await context.bot.send_message(uid,bold(f"✅ تم تسجيل وإرسال جميع صور الحل للأستاذ بنجاح.\n⭐ {'أضيفت نقاط المهمة إلى حسابك.' if state.get('added') else 'تم استبدال تسليمك السابق.'}\n\nهل تود تغيير الإجابات لوجود خطأ في إحدى الصور؟\nيمكنك تغييرها مرتين فقط لكل امتحان أو واجب."),parse_mode=ParseMode.HTML,reply_markup=confirm_kb)
+    try: await context.bot.send_message(uid,bold(f"✅ تم تسجيل وإرسال جميع صور الحل للأستاذ بنجاح.\n⭐ {'أضيفت نقاط المهمة إلى حسابك.' if state.get('added') else 'تم استبدال تسليمك السابق.'}\n\nهل تود تغيير الإجابات لوجود خطأ في إحدى الصور؟\nيمكنك تغييرها مرة واحدة فقط لكل امتحان أو واجب."),parse_mode=ParseMode.HTML,reply_markup=confirm_kb)
     except TelegramError: pass
 
 
@@ -1150,7 +1142,7 @@ async def track_chat_member(update: Update,context: ContextTypes.DEFAULT_TYPE):
     status=change.new_chat_member.status
     if status in (ChatMemberStatus.MEMBER,ChatMemberStatus.RESTRICTED,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER):
         student=await get_student(user.id)
-        if student and student["approved"] and student.get("parent_chat_id"): await mark_member_compliant(user.id)
+        if student and student["approved"] and (student.get("parent_chat_id") or student.get("admin_manual_active")): await mark_member_compliant(user.id)
         else:
             await observe_group_member(user.id,ACTIVATION_GRACE_HOURS)
             try: await context.bot.send_message(user.id,bold(f"⏳ لديك {ACTIVATION_GRACE_HOURS} ساعة لتسجيل وتفعيل بوت الأحياء وربط ولي الأمر، وإلا ستُزال من كروب الدورة."),parse_mode=ParseMode.HTML)
@@ -1160,7 +1152,7 @@ async def track_chat_member(update: Update,context: ContextTypes.DEFAULT_TYPE):
 async def observe_group_activity(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id!=BIOLOGY_GROUP_ID or not update.effective_user or update.effective_user.is_bot or is_admin(update.effective_user.id): return
     student=await get_student(update.effective_user.id)
-    if student and student["approved"] and student.get("parent_chat_id"): await mark_member_compliant(update.effective_user.id)
+    if student and student["approved"] and (student.get("parent_chat_id") or student.get("admin_manual_active")): await mark_member_compliant(update.effective_user.id)
     else: await observe_group_member(update.effective_user.id,ACTIVATION_GRACE_HOURS)
 
 
@@ -1800,7 +1792,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("تم رفض الطلب"); await query.edit_message_text((query.message.text_html or bold("طلب التفعيل"))+bold("\n\n❌ تم رفض الطلب."),parse_mode=ParseMode.HTML); return
     admin=is_admin(uid); student=None if admin else await get_student(uid)
     public=(data in {"menu","today_prep","playlists","study_resources","past_exams"} or data.startswith(("prepopen|","chapter|","lecture|","archivechapter|","archivelecture|","archiveexam|","resourcecategory|booklet","resourcecategory|summary","resourcecategory|ministerial","resourcechapter|booklet","resourcechapter|summary","resourcechapter|ministerial","resourceitem|")))
-    if not admin and student and student["approved"] and not student.get("parent_chat_id") and not await db.bio6_listener(uid) and not public:
+    if not admin and student and student["approved"] and not student.get("parent_chat_id") and not student.get("admin_manual_active") and not await db.bio6_listener(uid) and not public:
         await query.answer("يجب ربط ولي الأمر أولاً لفتح خدمات الدورة.",show_alert=True); return
     if not admin and (not student or not student["approved"]) and not public:
         await query.answer("هذه الخدمة مخصصة لطلاب الدورة المفعّلين.",show_alert=True); return
@@ -2482,8 +2474,8 @@ async def grade_command(update: Update,context: ContextTypes.DEFAULT_TYPE):
     noun="الواجب" if row["kind"]=="homework" else "الامتحان"
     await update.effective_message.reply_text(bold(f"✅ تم تسجيل درجة {row['full_name']}: {grade}/100"),parse_mode=ParseMode.HTML)
     await notify_student_and_parent(context.bot,row,f"📊 درجة {noun}\n👤 الطالب: {row['full_name']}\n📌 {row['title']}\n✅ الدرجة: {grade}/100")
-    if row["kind"]=="exam" and grade<60 and not await db.bio6_listener(row["user_id"]) and not await task_is_hard(db,reference["task_id"]):
-        count=await add_warning(row["user_id"],f"رسوب في {row['title']} بدرجة {grade}",update.effective_user.id,reference["task_id"])
+    if row["kind"]=="exam" and grade<80:
+        count=(await get_student(row["user_id"]))["warnings"]
         await notify_student_and_parent(context.bot,row,f"⚠️ إنذار رسوب ({count}/{MAX_WARNINGS})\nالدرجة: {grade}/100")
     if row["kind"]=="exam": await announce_champions(context,reference["task_id"])
 
@@ -2516,7 +2508,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(bold("👑 مركز ادارة الأحياء\n━━━━━━━━━━━━━━━━━━\nاختر القسم الذي تريد ادارته"),parse_mode=ParseMode.HTML,reply_markup=main_menu(True)); return
     student=await get_student(update.effective_user.id)
     if not student or not student["approved"]: await start(update,context); return
-    if not student.get("parent_chat_id") and not await db.bio6_listener(update.effective_user.id):
+    if not student.get("parent_chat_id") and not student.get("admin_manual_active") and not await db.bio6_listener(update.effective_user.id):
         await update.effective_message.reply_text(bold(f"🔒 يجب ربط ولي الأمر أولاً.\nرمزك: {student['parent_link_code']}\nولي الأمر ينسخ ويرسل:")+f"\n<code>/parent {escape(student['parent_link_code'])}</code>",parse_mode=ParseMode.HTML,reply_markup=parent_copy_markup(student["parent_link_code"])); return
     if not await is_channel_member(context.bot,update.effective_user.id):
         await update.effective_message.reply_text(bold("🔒 يجب الاشتراك بقناة منصة المجتهد أولاً."),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 الاشتراك بالقناة",url=REQUIRED_CHANNEL_URL)]])); return
@@ -2847,8 +2839,11 @@ def main():
     app.add_handler(CallbackQueryHandler(spam_guard),group=-1)
     app.add_handler(ChatMemberHandler(track_chat_member,ChatMemberHandler.CHAT_MEMBER),group=-2)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS,observe_group_activity),group=-2)
+    app.add_handler(MessageHandler(~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),v11_input_dispatch),group=-4)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,genetics_input_dispatch),group=-5)
     app.add_handler(registration,group=0)
     app.add_handler(CommandHandler("menu",menu_command),group=0)
+    app.add_handler(CommandHandler("topics_check",submission_topics_check_command),group=0)
     app.add_handler(CommandHandler("cancel",cancel_registration),group=0)
     app.add_handler(CommandHandler("warn",warn_command),group=0)
     app.add_handler(CommandHandler("unwarn",unwarn_command),group=0)
@@ -2924,7 +2919,7 @@ async def linked_exam_dispatch_job(context: ContextTypes.DEFAULT_TYPE):
         created=await dispatch_exams(datetime.now(TIMEZONE))
         for task in created:
             if task.get('exam_difficulty'):
-                level='صعب اختياري — 60 XP أساسية، بلا إنذار' if task['exam_difficulty']=='hard' else 'سهل إلزامي — 20 XP أساسية'
+                level='صعب اختياري — 60 XP أساسية، النجاح من 80' if task['exam_difficulty']=='hard' else 'سهل إلزامي — 20 XP أساسية'
                 end=task['deadline'].astimezone(TIMEZONE).strftime('%d/%m/%Y %H:%M')
                 task={**task,'title':f"{task['title']} — {level} — ينتهي {end}"}
             for student in await assigned_students(task["id"]):
@@ -3369,7 +3364,7 @@ async def button_handler(update,context):
             if not student or int(student.get("current_chapter") or 0)!=int(task.get("chapter") or 0):
                 await query.answer("🔒 هذا الامتحان مخصص لفصل آخر وليس لمسارك الحالي.",show_alert=True); return
         effective=await effective_task_deadline(task_id,uid)
-        if not effective or not effective.get("assigned") or (effective.get("deadline") and effective["deadline"]<=datetime.now(TIMEZONE) and not effective.get("submitted")):
+        if not effective or not effective.get("assigned") or (effective.get("deadline") and effective["deadline"]<=datetime.now(TIMEZONE) and not (effective or {}).get("submitted")):
             await query.answer("⏰ انتهت مدة الامتحان. إذا كان لديك تمديد معتمد فافتح قسم الامتحانات من جديد.",show_alert=True); return
         await show_task(query,context,task_id); return
     if data.startswith("extendhours|"):
@@ -5348,7 +5343,7 @@ async def show_task(query,context,task_id):
     task=await get_task(task_id)
     if not is_admin(query.from_user.id):
         student=await get_student(query.from_user.id)
-        if not student or not student.get('approved') or student.get('reset_pending') or (not student.get('parent_chat_id') and not await db.bio6_listener(query.from_user.id)):
+        if not student or not student.get('approved') or student.get('reset_pending') or (not student.get('parent_chat_id') and not student.get('admin_manual_active') and not await db.bio6_listener(query.from_user.id)):
             await query.answer('هذه الخدمة تحتاج حساباً مفعلاً وربط ولي الأمر.',show_alert=True);return
         if not await is_channel_member(context.bot,query.from_user.id):
             await query.answer('اشترك بالقناة المطلوبة أولاً.',show_alert=True);return
@@ -5489,29 +5484,35 @@ async def v48_capture_quick_review(update,context):
 
 
 async def _v48_deliver_submission_row(bot,row):
-    """Deliver once, then register; a sent Telegram message is retained for DB retry."""
+    """Deliver only inside the student's named forum topic, never General."""
     sent_id=row.get('delivered_message_id')
+    legacy_general_id=sent_id if sent_id and not row.get('destination_thread_id') else None
+    if legacy_general_id:
+        # An unfinished outbox row from an older release may point at General.
+        # Re-deliver into the student's topic before accepting that delivery.
+        sent_id=None
     caption=bold(f"📥 {row['title']}\n👤 الطالب: {row['full_name']}\n🆔 {row['user_id']}\n🔐 رقم التسليم: {row['id']}")
     if not sent_id:
-        kwargs={'chat_id':row['destination_chat_id'],'caption':caption,'parse_mode':ParseMode.HTML,
-                'message_thread_id':row.get('destination_thread_id') or None}
+        student=await get_student(row['user_id'])
+        if not student:
+            raise TopicRoutingError('حساب الطالب غير موجود؛ بقي التسليم في الطابور.')
+        sent,thread_id=await _submission_topic_router.send(bot,row,student,caption=caption,parse_mode=ParseMode.HTML)
+        # Store Telegram's message id and actual thread together. If database
+        # persistence fails, remove the message so it cannot be double-graded.
         try:
-            if row['payload_type']=='photo': sent=await bot.send_photo(photo=row['file_id'],**kwargs)
-            elif row['payload_type']=='document': sent=await bot.send_document(document=row['file_id'],**kwargs)
-            else: sent=await bot.send_video(video=row['file_id'],**kwargs)
-        except BadRequest:
-            if not kwargs.get('message_thread_id'): raise
-            kwargs['message_thread_id']=None
-            if row['payload_type']=='photo': sent=await bot.send_photo(photo=row['file_id'],**kwargs)
-            elif row['payload_type']=='document': sent=await bot.send_document(document=row['file_id'],**kwargs)
-            else: sent=await bot.send_video(video=row['file_id'],**kwargs)
-            row={**dict(row),'destination_thread_id':None}
-        marked=await db.v48_mark_delivery_sent(row['id'],sent.message_id,row.get('destination_thread_id'))
+            marked=await db.v48_mark_delivery_sent(row['id'],sent.message_id,thread_id)
+        except Exception:
+            try: await bot.delete_message(row['destination_chat_id'],sent.message_id)
+            except TelegramError: pass
+            raise
         if not marked:
             try: await bot.delete_message(row['destination_chat_id'],sent.message_id)
             except TelegramError: pass
             raise RuntimeError('delivery row disappeared before Telegram message was recorded')
-        row={**dict(row),**dict(marked)}; sent_id=sent.message_id
+        row={**dict(row),**dict(marked)};sent_id=sent.message_id
+        if legacy_general_id:
+            try: await bot.delete_message(row['destination_chat_id'],legacy_general_id)
+            except TelegramError: logger.warning('Old General message could not be deleted: %s',legacy_general_id)
     result=await record_submission(row['task_id'],row['user_id'],row['student_message_id'],
         row['file_unique_id'],row.get('media_group_id'))
     registered=await db.v48_delivery_submission_registered(row['id'])
@@ -5553,7 +5554,7 @@ async def receive_submission(update: Update,context: ContextTypes.DEFAULT_TYPE):
     task_id=context.user_data.get('waiting_submission')
     if not task_id: return False
     student=await get_student(update.effective_user.id)
-    if not student or not student.get('approved') or (not student.get('parent_chat_id') and not await db.bio6_listener(update.effective_user.id)) or not await is_channel_member(context.bot,update.effective_user.id):
+    if not student or not student.get('approved') or (not student.get('parent_chat_id') and not student.get('admin_manual_active') and not await db.bio6_listener(update.effective_user.id)) or (not student.get('admin_manual_active') and not await is_channel_member(context.bot,update.effective_user.id)):
         context.user_data.pop('waiting_submission',None)
         await update.effective_message.reply_text(bold('🔒 لا يمكنك التسليم: يجب تفعيل الحساب وربط ولي الامر والاشتراك بالقناة.'),parse_mode=ParseMode.HTML); return True
     task=await get_task(task_id); effective=await effective_task_deadline(task_id,update.effective_user.id) if task else None
@@ -5579,14 +5580,19 @@ async def receive_submission(update: Update,context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text('⏰ انتهت صلاحية التسليم او تغيرت حالة الامتحان. افتحه من جديد بعد التمديد.'); return True
     if status=='duplicate':
         await msg.reply_text('🚫 هذا الملف مسجل كتسليم سابق لطالب اخر. ارسل ملف اجابتك الاصلي.'); return True
-    # Topic creation is a Telegram network operation. The durable row must exist first;
-    # if the forum/topic is unavailable, deliver to the configured chat without a topic.
-    thread_id=None
-    try: thread_id=await ensure_student_topic(context.bot,student,destination)
-    except Exception as exc: logger.warning('Student topic unavailable; using destination root: %s',exc)
-    if thread_id:
-        staged=await db.v48_stage_submission_delivery(task_id,update.effective_user.id,msg.message_id,payload_type,
-            media.file_id,media.file_unique_id,msg.media_group_id,destination,thread_id)
+    # The outbox is durable, but no submission is allowed in General.
+    try:
+        thread_id=await _submission_topic_router.ensure(context.bot,student,destination)
+    except Exception as exc:
+        logger.warning('Student topic not ready, submission queued: user=%s chat=%s: %s',
+                       update.effective_user.id,destination,exc)
+        await db.v48_mark_delivery_retry(staged['delivery']['id'],exc,SUBMISSION_RETRY_SECONDS)
+        await msg.reply_text(bold('⏳ حفظت إجابتك، لكن توبكك الخاص غير متاح حالياً. لم تُرسل إلى General. سيعيد البوت المحاولة تلقائياً.'),parse_mode=ParseMode.HTML)
+        return True
+    staged=await db.v48_stage_submission_delivery(task_id,update.effective_user.id,msg.message_id,payload_type,
+        media.file_id,media.file_unique_id,msg.media_group_id,destination,thread_id)
+    if staged.get('status')!='ok':
+        await msg.reply_text('⚠️ تغيّرت حالة التسليم أثناء إنشاء التوبك. افتح المهمة مجدداً.');return True
     row={**dict(staged['delivery']),'title':task['title'],'kind':task['kind'],'full_name':student['full_name'],'parent_chat_id':student.get('parent_chat_id')}
     try:
         result=await _v48_deliver_submission_row(context.bot,row)
@@ -6719,7 +6725,7 @@ async def v52_exam_lecture(query,chapter,lecture):
 
 async def v52_open_exam(query,context,definition_id):
     student=await get_student(query.from_user.id)
-    if not student or (not student.get('parent_chat_id') and not await db.bio6_listener(query.from_user.id)):
+    if not student or (not student.get('parent_chat_id') and not student.get('admin_manual_active') and not await db.bio6_listener(query.from_user.id)):
         await query.answer('يجب ربط ولي الأمر أولا.',show_alert=True); return
     result=await db.v52_prepare_chapter_exam(definition_id,query.from_user.id)
     if result.get('status')=='locked':
@@ -7179,7 +7185,7 @@ async def button_handler(update,context):
         if not student or student.get('reset_pending'):
             return await _v52_previous_button_handler(update,context)
         state=await db.v52_submission_state(task_id,uid)
-        if state and state.get('model_answer_sent_at'):
+        if state and state.get('model_answer_sent_at') and not state.get('teacher_change_pending'):
             context.user_data.pop('waiting_submission',None)
             await query.answer('وصل الجواب النموذجي؛ ثبتت إجابتك ولا يمكن تغييرها.',show_alert=True); return
     if data.startswith('v52_model_answer_add|'):
@@ -7270,7 +7276,7 @@ async def private_messages(update,context):
     task_id=context.user_data.get('waiting_submission')
     if task_id:
         state=await db.v52_submission_state(task_id,update.effective_user.id)
-        if state and state.get('model_answer_sent_at'):
+        if state and state.get('model_answer_sent_at') and not state.get('teacher_change_pending'):
             context.user_data.pop('waiting_submission',None)
             await update.effective_message.reply_text(bold(
                 '🔒 وصل إليك الجواب النموذجي لهذا الامتحان، لذلك ثبتت إجابتك ولا يمكن تغييرها.'),parse_mode=ParseMode.HTML); return
@@ -7523,6 +7529,14 @@ async def v54_school_review_job(context):
     for due in await db.v54_due_school_review_exams():
         result=await db.v54_prepare_school_review_exam(due['review_id'],due['user_id']); task=result.get('task')
         if not task: continue
+        if result.get('status')=='open':
+            await db.v54_mark_school_review_exam_notified(due['review_id'],due['user_id'])
+            try:
+                await context.bot.send_message(due['user_id'],'✅ امتحان مراجعة المدرسة جاهز، يمكنك فتحه مباشرة.',
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('📝 فتح الامتحان',callback_data=f"task|{task['id']}")]]))
+            except TelegramError: pass
+            continue
+        if result.get('status')!='approval' or not result.get('notify'): continue
         review=await db.v54_school_review_by_id(due['review_id'],due['user_id'])
         sent=await _v54_notify_parent_exam(context,due['user_id'],task,review)
         if sent:
@@ -7565,7 +7579,9 @@ async def button_handler(update,context):
         if result['status']=='waiting':
             await query.answer('الامتحان لم يحن موعده أو لم تضف أسئلته بعد.',show_alert=True); return
         if result['status']=='submitted':
-            await query.answer('تم تسليم هذا الامتحان مسبقا.',show_alert=True); return
+            await query.answer(); await show_task(query,context,result['task']['id']); return
+        if result['status'] in ('closed','scheduled','unavailable','missing'):
+            await query.answer('انتهى موعد الامتحان أو لم يحن وقت فتحه بعد.',show_alert=True); return
         task=result['task']; review=await db.v54_school_review_by_id(review_id,uid)
         if result['status']=='open':
             await query.answer(); await show_task(query,context,task['id']); return
@@ -7927,6 +7943,43 @@ _install_admin_v9_last_additions(globals(),db,'biology')
 
 from start_role_routing import install as _install_start_role_routing
 _install_start_role_routing(globals(), db, 'biology')
+
+
+async def submission_topics_check_command(update, context):
+    """Admin-only, read-only checks for both submission destinations."""
+    if not is_admin(update.effective_user.id):
+        return
+    from student_submission_topics import check_destination
+    exam_ok, exam_note = await check_destination(context.bot, EXAM_SUBMISSIONS_CHAT_ID)
+    hw_ok, hw_note = await check_destination(context.bot, HOMEWORK_SUBMISSIONS_CHAT_ID)
+    lines = [
+        '🧵 فحص توبكات تسليم الحلول',
+        f"📝 الامتحانات: {'✅' if exam_ok else '❌'} {exam_note}",
+        f"📚 الواجبات: {'✅' if hw_ok else '❌'} {hw_note}",
+        '',
+        'إذا ظهر ❌ صحّح الآيدي أو فعّل Topics أو أعطِ البوت صلاحية إدارة المواضيع.',
+        'بعد التصحيح يعيد البوت إرسال الحلول المعلقة تلقائياً إلى توبك كل طالب.',
+        'هذا الفحص لا يرسل حلولاً ولا ينشئ توبكات تجريبية.',
+    ]
+    await update.effective_message.reply_text('\n'.join(lines))
+
+
+async def v11_input_dispatch(update, context):
+    if await v11_input_message(update, context):
+        raise ApplicationHandlerStop
+
+from student_submission_topics import StudentTopicRouter, TopicRoutingError
+_submission_topic_router=StudentTopicRouter(db)
+
+from reliability_v11 import install as _install_reliability_v11
+_install_reliability_v11(globals(), db)
+
+async def genetics_input_dispatch(update, context):
+    if await genetics_input_message(update, context):
+        raise ApplicationHandlerStop
+
+from genetics_v13 import install as _install_genetics_v13
+_install_genetics_v13(globals(), db)
 
 if __name__ == "__main__":
     main()

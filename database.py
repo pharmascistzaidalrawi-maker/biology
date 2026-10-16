@@ -1487,9 +1487,21 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
                 LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
                 WHERE t.id=%s AND (d.id IS NULL OR d.deleted_at IS NULL) FOR UPDATE OF t;""",(user_id,user_id,task_id));eligible=cur.fetchone()
             if not eligible or eligible.get('exam_pending_activation'): return "not_allowed"
-            cur.execute("SELECT clock_timestamp() AS now;");now=cur.fetchone()['now']
+            # Use the timestamp when Telegram originally received a valid
+            # answer, not the later retry time. A Telegram topic outage must
+            # never make a previously accepted answer "late".
+            cur.execute("""SELECT created_at FROM biology_submission_delivery_outbox
+                WHERE task_id=%s AND user_id=%s AND student_message_id=%s
+                  AND file_unique_id=%s AND status='pending'
+                ORDER BY id DESC LIMIT 1;""",
+                (task_id,user_id,message_id,file_unique_id))
+            queued=cur.fetchone()
+            if queued:
+                now=queued['created_at']
+            else:
+                cur.execute("SELECT clock_timestamp() AS now;");now=cur.fetchone()['now']
             if eligible['effective_deadline']<=now: return "expired"
-            if eligible.get('closed') and not (eligible.get('extended_until') and eligible['extended_until']>now): return "not_allowed"
+            if eligible.get('closed') and not queued and not (eligible.get('extended_until') and eligible['extended_until']>now): return "not_allowed"
             if eligible.get('exam_available_at') and eligible['exam_available_at']>now: return "not_allowed"
             if eligible.get('exam_approval_required'):
                 cur.execute("SELECT 1 FROM biology_exam_access WHERE task_id=%s AND user_id=%s AND status='approved';",(task_id,user_id))
@@ -1497,10 +1509,13 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
             if file_unique_id:
                 cur.execute("SELECT user_id FROM biology_submission_files WHERE task_id=%s AND file_unique_id=%s;",(task_id,file_unique_id))
                 if cur.fetchone(): return "duplicate"
-            cur.execute("SELECT submission_no,submitted_at,media_group_id FROM biology_submissions WHERE task_id=%s AND user_id=%s FOR UPDATE;",(task_id,user_id)); old=cur.fetchone(); number=(old["submission_no"]+1) if old else 1
+            cur.execute("SELECT submission_no,submitted_at,media_group_id,grade,revision_open,teacher_change_pending,rejected FROM biology_submissions WHERE task_id=%s AND user_id=%s FOR UPDATE;",(task_id,user_id)); old=cur.fetchone(); number=(old["submission_no"]+1) if old else 1
             cur.execute("SELECT kind,xp_reward FROM biology_tasks WHERE id=%s;",(task_id,)); task=cur.fetchone()
-            same_album=bool(old and old.get("submitted_at") and media_group_id and old.get("media_group_id")==media_group_id)
-            if old and old.get("submitted_at") and not same_album: return "exam_locked"
+            same_album=bool(old and old.get("submitted_at") and not old.get("revision_open") and media_group_id and old.get("media_group_id")==media_group_id)
+            if old and (old.get("grade") is not None or old.get("rejected")): return "exam_locked"
+            if old and old.get("submitted_at") and not same_album and not old.get("revision_open"): return "exam_locked"
+            if old and old.get("revision_open"):
+                cur.execute("DELETE FROM biology_submission_review_messages WHERE task_id=%s AND user_id=%s;",(task_id,user_id))
             cur.execute("""INSERT INTO biology_submission_files(task_id,user_id,message_id,file_unique_id,media_group_id)
                 VALUES(%s,%s,%s,%s,%s) ON CONFLICT(task_id,file_unique_id) DO NOTHING RETURNING message_id;""",
                 (task_id,user_id,message_id,file_unique_id,media_group_id))
@@ -1510,7 +1525,7 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
             cur.execute("""INSERT INTO biology_submissions(task_id,user_id,submission_no,message_id,file_unique_id,media_group_id)
             VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(task_id,user_id) DO UPDATE SET submission_no=EXCLUDED.submission_no,
             message_id=EXCLUDED.message_id,file_unique_id=EXCLUDED.file_unique_id,submitted_at=CURRENT_TIMESTAMP,
-            grade=NULL,graded_by=NULL,graded_at=NULL,media_group_id=EXCLUDED.media_group_id;""",
+            grade=NULL,graded_by=NULL,graded_at=NULL,revision_open=FALSE,teacher_change_pending=FALSE,media_group_id=EXCLUDED.media_group_id;""",
             (task_id,user_id,number,message_id,file_unique_id,media_group_id))
             if not old:
                 _set_xp_event(cur,user_id,task["xp_reward"],"تسليم الواجب" if task["kind"]=="homework" else "تسليم الامتحان",f"submission:{task_id}:{user_id}")
@@ -1522,6 +1537,9 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
                  AND reason LIKE 'عدم إرسال%%' ORDER BY created_at LIMIT 1) RETURNING id;""",(task_id,user_id))
                 if cur.fetchone():
                     cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-1) WHERE user_id=%s;",(user_id,))
+            if queued:
+                cur.execute("""UPDATE biology_submissions SET submitted_at=%s
+                    WHERE task_id=%s AND user_id=%s;""",(now,task_id,user_id))
             conn.commit(); return "replaced" if old else "added"
     return await run(op)
 
@@ -1549,10 +1567,11 @@ async def prepare_submission_retry(task_id,user_id):
 async def set_submission_grade(task_id,user_id,grade,graded_by):
     def op():
         with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM biology_students WHERE user_id=%s FOR UPDATE;", (user_id,))
             cur.execute("SELECT kind,title FROM biology_tasks WHERE id=%s;",(task_id,)); task=cur.fetchone()
             if not task: return None
             cur.execute("""UPDATE biology_submissions SET grade=%s,graded_by=%s,graded_at=CURRENT_TIMESTAMP
-                WHERE task_id=%s AND user_id=%s RETURNING task_id;""",(grade,graded_by,task_id,user_id))
+                WHERE task_id=%s AND user_id=%s AND revision_open=FALSE AND teacher_change_pending=FALSE AND rejected=FALSE RETURNING task_id;""",(grade,graded_by,task_id,user_id))
             if not cur.fetchone(): return None
             if task["kind"]=="exam":
                 _set_xp_event(cur,user_id,grade-80,"تعديل XP حسب درجة الامتحان",f"grade:{task_id}:{user_id}")
@@ -1575,8 +1594,13 @@ async def grade_submission_by_review(chat_id,message_id,grade,graded_by):
             cur.execute("""SELECT r.task_id,r.user_id FROM biology_submission_review_messages r
             WHERE r.chat_id=%s AND r.message_id=%s;""",(chat_id,message_id)); ref=cur.fetchone()
             if not ref: return None
+            cur.execute("SELECT user_id FROM biology_students WHERE user_id=%s FOR UPDATE;", (ref['user_id'],))
             cur.execute("""UPDATE biology_submissions SET grade=%s,graded_by=%s,graded_at=CURRENT_TIMESTAMP
-            WHERE task_id=%s AND user_id=%s;""",(grade,graded_by,ref["task_id"],ref["user_id"]))
+            WHERE task_id=%s AND user_id=%s AND revision_open=FALSE AND teacher_change_pending=FALSE AND rejected=FALSE
+            AND EXISTS(SELECT 1 FROM biology_submission_review_messages r WHERE r.chat_id=%s AND r.message_id=%s
+                AND r.task_id=biology_submissions.task_id AND r.user_id=biology_submissions.user_id)
+            RETURNING task_id;""",(grade,graded_by,ref["task_id"],ref["user_id"],chat_id,message_id))
+            if not cur.fetchone(): return None
             cur.execute("SELECT kind FROM biology_tasks WHERE id=%s;",(ref["task_id"],)); task_kind=cur.fetchone()
             if task_kind and task_kind["kind"]=="exam":
                 bonus=grade-80
@@ -1601,8 +1625,10 @@ async def submission_by_review(chat_id,message_id):
 async def save_exam_correction(task_id,user_id,payload_type,file_id,grade,corrected_by):
     def op():
         with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM biology_students WHERE user_id=%s FOR UPDATE;", (user_id,))
             cur.execute("""UPDATE biology_submissions SET grade=%s,graded_by=%s,graded_at=CURRENT_TIMESTAMP
-            WHERE task_id=%s AND user_id=%s;""",(grade,corrected_by,task_id,user_id))
+            WHERE task_id=%s AND user_id=%s AND revision_open=FALSE AND teacher_change_pending=FALSE AND rejected=FALSE RETURNING task_id;""",(grade,corrected_by,task_id,user_id))
+            if not cur.fetchone(): return None
             cur.execute("""INSERT INTO biology_exam_corrections(task_id,user_id,payload_type,file_id,grade,corrected_by)
             VALUES(%s,%s,%s,%s,%s,%s);""",(task_id,user_id,payload_type,file_id,grade,corrected_by))
             cur.execute("SELECT kind FROM biology_tasks WHERE id=%s;",(task_id,)); task=cur.fetchone()
@@ -5218,6 +5244,12 @@ async def v48_stage_submission_delivery(task_id,user_id,student_message_id,paylo
             if task.get('exam_approval_required'):
                 cur.execute("SELECT 1 FROM biology_exam_access WHERE task_id=%s AND user_id=%s AND status='approved';",(int(task_id),int(user_id)))
                 if not cur.fetchone(): return {'status':'not_allowed'}
+            cur.execute("SELECT * FROM biology_submissions WHERE task_id=%s AND user_id=%s FOR UPDATE;", (int(task_id),int(user_id)))
+            previous=cur.fetchone()
+            if previous and previous.get('submitted_at') and not previous.get('revision_open'):
+                same_album=bool(media_group_id and previous.get('media_group_id')==media_group_id)
+                if previous.get('grade') is not None or previous.get('rejected') or not same_album:
+                    return {'status':'not_allowed'}
             cur.execute("SELECT user_id FROM biology_submission_files WHERE task_id=%s AND file_unique_id=%s;",(int(task_id),str(file_unique_id)))
             used=cur.fetchone()
             if used and int(used['user_id'])!=int(user_id): return {'status':'duplicate'}
@@ -7649,7 +7681,7 @@ async def v52_mark_model_answer_sent(task_id,user_id):
 async def v52_submission_state(task_id,user_id):
     def op():
         with connect() as conn,conn.cursor() as cur:
-            cur.execute("""SELECT submitted_at,model_answer_due_at,model_answer_sent_at,retry_count
+            cur.execute("""SELECT submitted_at,model_answer_due_at,model_answer_sent_at,retry_count,grade,revision_open,teacher_change_pending,rejected
                 FROM biology_submissions WHERE task_id=%s AND user_id=%s;""",(int(task_id),int(user_id)))
             return cur.fetchone()
     return await run(op)
@@ -7666,7 +7698,8 @@ async def prepare_submission_retry(task_id,user_id):
 _v52_previous_record_submission=record_submission
 async def record_submission(task_id,user_id,message_id,file_unique_id,media_group_id=None):
     state=await v52_submission_state(task_id,user_id)
-    if state and state.get('model_answer_sent_at'): return "model_answer_locked"
+    if state and state.get('model_answer_sent_at') and not state.get('teacher_change_pending') and not await v10_queued_submission_accepted(task_id,user_id,message_id,file_unique_id):
+        return "model_answer_locked"
     result=await _v52_previous_record_submission(task_id,user_id,message_id,file_unique_id,media_group_id)
     if result in ('added','replaced'):
         def op():
@@ -7683,7 +7716,8 @@ _v52_previous_stage_submission=v48_stage_submission_delivery
 async def v48_stage_submission_delivery(task_id,user_id,student_message_id,payload_type,file_id,
                                         file_unique_id,media_group_id,destination_chat_id,destination_thread_id=None):
     state=await v52_submission_state(task_id,user_id)
-    if state and state.get('model_answer_sent_at'): return {'status':'model_answer_locked'}
+    if state and (state.get('grade') is not None or state.get('rejected')): return {'status':'not_allowed'}
+    if state and state.get('model_answer_sent_at') and not state.get('teacher_change_pending'): return {'status':'model_answer_locked'}
     return await _v52_previous_stage_submission(task_id,user_id,student_message_id,payload_type,file_id,
         file_unique_id,media_group_id,destination_chat_id,destination_thread_id)
 
@@ -7993,3 +8027,13 @@ async def v60_set_study_days(user_id,days,_repair=False):
 
 # Override historical fixed-day aliases after all older migrations.
 v41_set_study_days=v60_set_study_days
+async def v10_queued_submission_accepted(task_id,user_id,message_id,file_unique_id):
+    """Was this exact file already accepted by the durable outbox?"""
+    def op():
+        with connect() as conn,conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM biology_submission_delivery_outbox
+                WHERE task_id=%s AND user_id=%s AND student_message_id=%s
+                  AND file_unique_id=%s AND status='pending') AS accepted;""",
+                (int(task_id),int(user_id),int(message_id),str(file_unique_id)))
+            return bool(cur.fetchone()['accepted'])
+    return await run(op)

@@ -165,7 +165,7 @@ def install(ns, db, subject):
         context.user_data['start_role'] = 'student'
         # Run the normal start handler inside ConversationHandler so REG_NAME,
         # REG_SCHOOL, etc. continue to work after pressing the student button.
-        return await start(update, context)
+        return await ns['start'](update, context)
 
     async def button_handler(update, context):
         # ConversationHandler handles role buttons in group=0. Ignore the same
