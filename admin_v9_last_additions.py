@@ -31,11 +31,11 @@ def parse_hours(value):
 
 
 def install(ns, db, subject):
-    if subject not in ('biology', 'english'):
+    if subject not in ('biology', 'biology'):
         raise ValueError('Unsupported subject')
     B, K = ns['InlineKeyboardButton'], ns['InlineKeyboardMarkup']
     admin = ns['is_admin']
-    label = 'الأحياء' if subject == 'biology' else 'الإنكليزي'
+    label = 'الأحياء' if subject == 'biology' else 'الأحياء'
     T = subject
     TelegramError = ns['TelegramError']
 
@@ -55,7 +55,16 @@ def install(ns, db, subject):
                 deleted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(task_id,user_id));
                 CREATE INDEX IF NOT EXISTS {T}_v9_deleted_warning_user_idx
-                ON {T}_v9_deleted_task_warnings(user_id);''')
+                ON {T}_v9_deleted_task_warnings(user_id);
+                -- Backfill explicit removals from older releases, not automatic
+                -- retractions caused by deadline extensions.
+                INSERT INTO {T}_v9_deleted_task_warnings(task_id,user_id,deleted_by)
+                SELECT t.id,s.user_id,a.actor_id
+                FROM {T}_audit a
+                JOIN {T}_tasks t ON t.id=(substring(a.details from 'task_id=([0-9]+)'))::INTEGER
+                JOIN {T}_students s ON s.user_id=(substring(a.details from 'user_id=([0-9]+)'))::BIGINT
+                WHERE a.action='remove_selected_warning'
+                ON CONFLICT(task_id,user_id) DO NOTHING;''')
             conn.commit()
 
     previous_post = ns['post_init']

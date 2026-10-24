@@ -41,7 +41,7 @@ def draft_expired(draft, now):
 
 
 def install(ns, db, prefix):
-    if prefix not in {'biology', 'english', 'french', 'islamic'}:
+    if prefix not in {'biology', 'biology', 'biology', 'french', 'islamic'}:
         raise ValueError('Unknown subject')
     B, K = ns['InlineKeyboardButton'], ns['InlineKeyboardMarkup']
     zone = ns['TIMEZONE']
@@ -135,7 +135,7 @@ def install(ns, db, prefix):
     def chapters():
         from data import PLAYLISTS
         return sorted(int(ch) for ch in PLAYLISTS)
-    chapter_label = {'biology': 'الفصل', 'english': 'اليونت', 'french': 'الموضوع', 'islamic': 'الوحدة'}[prefix]
+    chapter_label = {'biology': 'الفصل', 'biology': 'الفصل', 'biology': 'الفصل', 'french': 'الموضوع', 'islamic': 'الوحدة'}[prefix]
 
     async def menu(q):
         rows = [[B('📚 نشر ملزمة جديدة', callback_data='respub|category|booklet')],

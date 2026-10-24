@@ -38,6 +38,11 @@ async def task_is_hard(db, task_id):
 
 
 def install(ns, db):
+    old_init=ns['init_db']
+    def init():
+        old_init()
+        migrate(db)
+    ns['init_db']=db.init_db=init
     B,K=ns['InlineKeyboardButton'],ns['InlineKeyboardMarkup']
     previous=ns['button_handler']
     async def button_handler(update, context):
@@ -49,7 +54,7 @@ def install(ns, db):
                 if not state.get('selected_lectures'):
                     await q.answer('اختر المحاضرات أولا.',show_alert=True); return
                 await q.answer()
-                await q.edit_message_text('اختر مستوى الامتحان:\n🟢 السهل: إلزامي، مهلة 24 ساعة من نزوله، ومكافأة 20 XP.\n🔴 الصعب: اختياري، بلا إنذار، ومكافأة 60 XP.',
+                await q.edit_message_text('اختر مستوى الامتحان:\n🟢 السهل: إلزامي، مهلة 24 ساعة من نزوله، ومكافأة 20 XP.\n🔴 الصعب: اختياري؛ عدم المشاركة بلا إنذار، والدرجة أقل من 80 عليها إنذار، ومكافأة 60 XP.',
                     reply_markup=K([[B('🟢 سهل — إلزامي',callback_data='difficulty_new|easy')],
                                     [B('🔴 صعب — اختياري ×3',callback_data='difficulty_new|hard')],
                                     [ns['back_menu']()]]));return

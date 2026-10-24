@@ -8,8 +8,8 @@ import logging
 import time
 
 ZONE = ZoneInfo('Asia/Baghdad')
-MODULES = ('exams','homework','school_review')
-LABELS = {'exams':'📝 الامتحانات','homework':'📚 الواجبات','school_review':'🏫 مراجعة المدرسة'}
+MODULES = ('lectures','exams','homework','school_review')
+LABELS = {'lectures':'🎬 المحاضرات والتحاضير','exams':'📝 الامتحانات','homework':'📚 الواجبات','school_review':'🏫 مراجعة المدرسة'}
 LOG = logging.getLogger(__name__)
 
 
@@ -90,7 +90,7 @@ def install(ns,db):
 
     async def flags(uid):
         row=await sql('SELECT * FROM biology_student_modules WHERE user_id=%s;',(int(uid),),True)
-        return row or dict(exams=True,homework=True,school_review=True,listener=False)
+        return row or dict(lectures=True,exams=True,homework=True,school_review=True,listener=False)
     db.bio6_flags=flags
     async def allowed(uid,module):
         if module not in MODULES:return True

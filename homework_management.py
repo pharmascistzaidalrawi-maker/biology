@@ -5,7 +5,7 @@ import secrets
 ZONE=ZoneInfo('Asia/Baghdad')
 
 def install(ns,db,prefix):
-    if prefix not in {'chemistry','english','mathematics','physics','biology','french','islamic'}:raise ValueError('Invalid subject')
+    if prefix not in {'biology','biology','mathematics','physics','biology','french','islamic'}:raise ValueError('Invalid subject')
     p=prefix;B=ns['InlineKeyboardButton'];K=ns['InlineKeyboardMarkup']
     async def sql(query,args=(),one=False,write=False):
         def op():
@@ -243,7 +243,7 @@ def install(ns,db,prefix):
             elif action=='close':
                 await sql(f'UPDATE {p}_tasks SET homework_manual_closed=TRUE,closed=TRUE WHERE id=%s;',(tid,),write=True);await panel(q,tid)
             elif action=='reopen':
-                now=datetime.now(ZONE);await sql(f'UPDATE {p}_tasks SET retired_obligation=FALSE,homework_manual_closed=FALSE,closed=FALSE,homework_opens_at=%s,deadline=%s WHERE id=%s;',(now,now+timedelta(days=1),tid),write=True)
+                now=datetime.now(ZONE);await sql(f'UPDATE {p}_tasks SET retired_obligation=FALSE,homework_manual_closed=FALSE,closed=FALSE,homework_opens_at=%s,deadline=%s WHERE id=%s;',(now,now+timedelta(days=2),tid),write=True)
                 await clear_extended_warnings(tid)
                 await panel(q,tid)
             elif action=='field':

@@ -13,28 +13,24 @@ def numbers(text):
     return sorted({int(v.strip()) for v in text.replace('+',',').split(',') if v.strip()})
 
 
-def course_plan(catalog, chapter, lecture, first_date, days, counts=None):
-    from course_schedule_v12 import pack_lessons
+def course_plan(catalog, chapter, lecture, first_date, days):
     days=set(days)
+    if not days or not days<=set(range(7)):raise ValueError('اختر يوماً واحداً على الأقل.')
     if first_date.weekday() not in days:raise ValueError('تاريخ البداية يجب أن يكون ضمن أيام الدراسة المحددة.')
     groups=catalog.get(chapter,[])
-    start=next((i for i,g in enumerate(groups) if lecture in g),None)
-    if start is None:raise ValueError('المحاضرة غير موجودة في التحاضير.')
-    rows=[]
+    start=next((i for i,group in enumerate(groups) if lecture in group),None)
+    if start is None:raise ValueError('المحاضرة ليست ضمن التحاضير؛ عدل مجموعات المحاضرات أولاً.')
+    result=[];cursor=first_date
     for ch in sorted(catalog):
         if ch<chapter:continue
-        for i,group in enumerate(catalog[ch]):
-            if ch==chapter and i<start:continue
-            selected=[n for n in group if n>=lecture] if ch==chapter and i==start else group
-            if selected:rows.append(dict(chapter=ch,prep_no=len(rows)+1,lectures=','.join(map(str,selected))))
-    if not rows:raise ValueError('الجدول فارغ.')
-    bundles=pack_lessons(rows,first_date,days,counts)
-    # Keep the source catalog number for compatibility with existing admin screens.
-    result=[]
-    for bundle in bundles:
-        ch=bundle['chapter'];first=int(bundle['lectures'].split(',')[0])
-        pno=next(i+1 for i,g in enumerate(catalog[ch]) if first in g)
-        result.append((ch,pno,bundle['lectures'],bundle['target_date']))
+        for index,group in enumerate(catalog[ch]):
+            if ch==chapter and index<start:continue
+            selected=[n for n in group if n>=lecture] if ch==chapter and index==start else list(group)
+            if not selected:continue
+            result.append((ch,index+1,','.join(map(str,selected)),cursor))
+            cursor+=timedelta(days=1)
+            while cursor.weekday() not in days:cursor+=timedelta(days=1)
+    if not result:raise ValueError('الجدول فارغ.')
     return result
 
 
@@ -132,6 +128,7 @@ async def edit_profile(db,uid,field,value,actor):
                     WHERE user_id=%s) WHERE user_id=%s;""",(uid,uid))
             else:
                 cur.execute(f'UPDATE biology_students SET {field}=%s WHERE user_id=%s;',(value,uid))
+
             if field=='xp':
                 wallet='chapter_xp' if old.get('study_track')=='chapter' else 'course_xp'
                 cur.execute(f'UPDATE biology_students SET {wallet}=%s WHERE user_id=%s;',(value,uid))
@@ -185,15 +182,15 @@ def install(ns,db):
         old_init();migrate(db)
         with db.connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT value FROM biology_settings WHERE key='admin_course_days';");row=cur.fetchone()
-            ns['_ADMIN_COURSE_DAYS']=json.loads(row['value']) if row else [2,3,5,6]
+            ns['_ADMIN_COURSE_DAYS']=json.loads(row['value']) if row else [1,3,5,6]
     db.init_db=init_db;ns['init_db']=init_db
     def next_date(value,days=None):
-        allowed=set(days or ns.get('_ADMIN_COURSE_DAYS') or [2,3,5,6]);value+=timedelta(days=1)
+        allowed=set(days or ns.get('_ADMIN_COURSE_DAYS') or [1,3,5,6]);value+=timedelta(days=1)
         while value.weekday() not in allowed:value+=timedelta(days=1)
         return value
     db._next_study_date=next_date
     def previous_date(value):
-        allowed=set(ns.get('_ADMIN_COURSE_DAYS') or [2,3,5,6]);value-=timedelta(days=1)
+        allowed=set(ns.get('_ADMIN_COURSE_DAYS') or [1,3,5,6]);value-=timedelta(days=1)
         while value.weekday() not in allowed:value-=timedelta(days=1)
         return value
     db._previous_study_date=previous_date
@@ -204,7 +201,7 @@ def install(ns,db):
     db.seed_preparations=seed;ns['seed_preparations']=seed
     old_due=db.due_preparations
     async def due(now):
-        return await sql(db,"SELECT * FROM biology_preparations WHERE (published=FALSE OR needs_announcement=TRUE) AND ((target_date-1)+TIME '22:00')<=%s ORDER BY target_date,prep_no;",(now.astimezone(ZONE).replace(tzinfo=None),))
+        return await sql(db,"SELECT * FROM biology_preparations WHERE (published=FALSE OR needs_announcement=TRUE) AND ((target_date-1)+TIME '23:00')<=%s ORDER BY target_date,prep_no;",(now.astimezone(ZONE).replace(tzinfo=None),))
     db.due_preparations=due;ns['due_preparations']=due
     old_mark=db.mark_preparation_published
     async def mark(pid):
@@ -369,7 +366,7 @@ def install(ns,db):
             elif data.startswith('ctl_calendar'):
                 context.user_data.pop('control_input',None);await q.answer();await calendar(q,int(data.split('|')[1]) if '|' in data else 0);return
             elif data=='ctl_rebuild':
-                state={'kind':'rebuild'};prompt='أرسل: الفصل | أول محاضرة | تاريخ البداية | أيام الدراسة\nمثال: 3 | 14 | 18/10/2026 | الأحد،الاثنين،الثلاثاء | 1،1،2\nالأعداد اختيارية؛ الافتراضي محاضرتان الثلاثاء وواحدة ببقية الأيام. يمكنك تغيير الأيام والأعداد. سأعرض الجدول للتأكيد قبل الحفظ.'
+                state={'kind':'rebuild'};prompt='أرسل: الفصل | أول محاضرة | تاريخ البداية | أيام الدراسة\nمثال: 3 | 5 | 19/10/2026 | الاثنين،الثلاثاء،الخميس\nتُحفظ مجموعات المحاضرات الأصلية، سواء محاضرة أو محاضرتان. يمكن اختيار محاضرات أقدم أو أحدث. سأعرض الجدول للتأكيد قبل الحفظ.'
             elif data=='ctl_rebuild_confirm':
                 draft=context.user_data.pop('control_rebuild',None)
                 if not draft or time.monotonic()-draft['at']>900:raise ValueError('انتهت صلاحية التأكيد؛ أعد تحديد الجدول.')
@@ -381,7 +378,7 @@ def install(ns,db):
                 await q.edit_message_text('تعديل اسم التحضير ومحاضراته في الدليل والجداول:',reply_markup=menu([[B('✏️ الاسم',callback_data=f'ctl_groupfield|{ch}|{pno}|title')],[B('🎬 المحاضرات',callback_data=f'v51_prep_edit|{ch}|{pno}')]]));return
             elif data.startswith('ctl_groupfield|'):
                 _,ch,pno,field=data.split('|');state={'kind':'group_title','chapter':int(ch),'prep':int(pno)};prompt='أرسل الاسم الجديد للتحضير.'
-            elif data=='ctl_add':state={'kind':'add'};prompt='أرسل: الفصل | المحاضرات | تاريخ التحضير | اسم التحضير\nمثال: 3 | 5+6 | 09/10/2026 | مراجعة المحاضرتين'
+            elif data=='ctl_add':state={'kind':'add'};prompt='أرسل: الفصل | المحاضرات | تاريخ التحضير | اسم التحضير\nمثال: 3 | 5+6 | 08/10/2026 | مراجعة المحاضرتين'
             elif data.startswith('ctl_row|'):
                 pid=int(data.split('|')[1]);r=await sql(db,'SELECT * FROM biology_preparations WHERE prep_no=%s;',(pid,),True)
                 if not r:raise ValueError('التحضير غير موجود.')
@@ -392,7 +389,7 @@ def install(ns,db):
                 if field=='delete':
                     context.user_data['control_input']={'kind':'row_delete','id':int(pid),'at':time.monotonic()}
                     await q.answer();await q.edit_message_text('هل تؤكد حذف هذا التحضير من جدول الدورة؟ يبقى تقدم الطلاب وامتحاناتهم محفوظاً.',reply_markup=menu([[B('تأكيد الحذف',callback_data=f'ctl_delete_confirm|{pid}',style='danger')]]));return
-                state={'kind':'row','id':int(pid),'field':field,'chapter':r['chapter']};prompt='أرسل '+{'title':'الاسم الجديد.','lectures':'أرقام المحاضرات مثل 1+2+3.','target_date':'التاريخ بصيغة 09/10/2026.','chapter':'الفصل والمحاضرات بصيغة: 4 | 1+2+3'}[field]
+                state={'kind':'row','id':int(pid),'field':field,'chapter':r['chapter']};prompt='أرسل '+{'title':'الاسم الجديد.','lectures':'أرقام المحاضرات مثل 1+2+3.','target_date':'التاريخ بصيغة 08/10/2026.','chapter':'الفصل والمحاضرات بصيغة: 4 | 1+2+3'}[field]
             elif data.startswith('ctl_delete_confirm|'):
                 state=context.user_data.pop('control_input',None);pid=int(data.split('|')[1])
                 if not state or state['kind']!='row_delete' or state['id']!=pid or time.monotonic()-state['at']>900:raise ValueError('أعد تأكيد الحذف.')
@@ -423,18 +420,11 @@ def install(ns,db):
             kind=state['kind']
             if 'target' in state and (not s or state['nonce']!=s['nonce'] or state['target']!=s['uid']):raise ValueError('تغير الطالب المحدد. افتح التعديل من جديد.')
             if kind=='rebuild':
-                parts=[v.strip() for v in text.split('|')]
-                if len(parts) not in (4,5):raise ValueError('أرسل الفصل | أول محاضرة | البداية | الأيام | أعداد المحاضرات اختيارياً.')
-                ch,lecture,day,rawdays=parts[:4];ch=int(ch);lecture=int(lecture);first=parse_date(day)
+                ch,lecture,day,rawdays=[v.strip() for v in text.split('|')];ch=int(ch);lecture=int(lecture);first=parse_date(day)
                 if first<datetime.now(ZONE).date():raise ValueError('اختر اليوم أو تاريخاً قادماً لتجنب إنذارات بأثر رجعي.')
                 names={'الاثنين':0,'الإثنين':0,'الثلاثاء':1,'الأربعاء':2,'الاربعاء':2,'الخميس':3,'الجمعة':4,'السبت':5,'الأحد':6,'الاحد':6}
-                ordered_days=[names[v.strip()] for v in rawdays.replace('،',',').split(',')]
-                days=sorted(set(ordered_days));counts=None
-                if len(parts)==5:
-                    values=[int(v.strip()) for v in parts[4].replace('،',',').split(',')]
-                    if len(values)!=len(ordered_days) or len(days)!=len(ordered_days):raise ValueError('أرسل عدد محاضرات واحد لكل يوم وبنفس الترتيب، دون تكرار الأيام.')
-                    counts=dict(zip(ordered_days,values))
-                valid_lectures(ch,str(lecture));rows=course_plan(ns['CHAPTER_PREPARATION_DISTRIBUTION'],ch,lecture,first,days,counts)
+                days=sorted({names[v.strip()] for v in rawdays.replace('،',',').split(',')})
+                valid_lectures(ch,str(lecture));rows=course_plan(ns['CHAPTER_PREPARATION_DISTRIBUTION'],ch,lecture,first,days)
                 context.user_data['control_rebuild']={'rows':rows,'days':days,'at':time.monotonic()}
                 context.user_data.pop('control_input',None)
                 sample='\n'.join(f'{d:%d/%m} — الفصل {c}: {n.replace(",","+")}' for c,p,n,d in rows[:5])

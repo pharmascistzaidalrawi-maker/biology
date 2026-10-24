@@ -39,7 +39,7 @@ def validate_window(start, end, now):
 
 
 def install(ns, db, prefix):
-    if prefix not in {'chemistry', 'english', 'mathematics', 'physics', 'biology', 'french', 'islamic'}:
+    if prefix not in {'biology', 'biology', 'mathematics', 'physics', 'biology', 'french', 'islamic'}:
         raise ValueError('Unknown subject')
     B, K = ns['InlineKeyboardButton'], ns['InlineKeyboardMarkup']
     zone = ns['TIMEZONE']

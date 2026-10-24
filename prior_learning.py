@@ -62,7 +62,7 @@ def synchronize(cur,p,uid):
           AND lp.completed_at IS NOT NULL);""",(int(uid),*boundary))
 
 def install(ns,db,p):
-    if p not in {'chemistry','english','mathematics','physics','biology','french','islamic'}:raise ValueError('Invalid subject')
+    if p not in {'biology','biology','mathematics','physics','biology','french','islamic'}:raise ValueError('Invalid subject')
     def sync(uid=None):
         with db.connect() as conn,conn.cursor() as cur:
             if uid is None:

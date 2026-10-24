@@ -119,6 +119,12 @@ def install(ns,db):
         destinations=activation_destinations(ns)
         sent=sum(await asyncio.gather(*(deliver(chat) for chat in destinations)))
         if not sent:await release_activation(db,uid)
+        else:
+            def mark_delivered():
+                with db.connect() as conn,conn.cursor() as cur:
+                    cur.execute('UPDATE biology_students SET activation_delivered_at=CURRENT_TIMESTAMP WHERE user_id=%s;',(uid,))
+                    conn.commit()
+            await db.run(mark_delivered)
         try:
             await bot.send_message(uid,('⏳ تم إرسال طلب تفعيلك إلى مجموعة التفعيل. يمكنك إعادة إرساله من الزر أدناه.' if sent else '⚠️ تعذر إيصال طلبك إلى مجموعة التفعيل. أخبر الإدارة أو حاول مجدداً.'),reply_markup=pending_menu(student))
         except ns['TelegramError']:
@@ -126,6 +132,18 @@ def install(ns,db):
         return {'status':'sent' if sent else 'failed','sent':sent,'total':len(destinations)}
     ns['send_activation_request']=send_activation
 
+    async def recover_activation(context):
+        def pending():
+            with db.connect() as conn,conn.cursor() as cur:
+                cur.execute('''SELECT * FROM biology_students WHERE approved=FALSE AND admin_blocked=FALSE
+                    AND reset_pending=FALSE AND activation_delivered_at IS NULL
+                    AND (activation_requested_at IS NULL OR activation_requested_at<CURRENT_TIMESTAMP-INTERVAL '5 minutes')
+                    ORDER BY activation_requested_at NULLS FIRST,user_id LIMIT 30;''')
+                return cur.fetchall()
+        for student in await db.run(pending):
+            try: await send_activation(context.bot,student)
+            except Exception: ns['logger'].exception('Activation recovery failed for %s',student['user_id'])
+    ns['recover_activation_requests']=recover_activation
     previous_start=ns['start']
     async def start(update,context):
         if ns['is_admin'](update.effective_user.id):
@@ -138,6 +156,8 @@ def install(ns,db):
         if student and (not student.get('approved') or student.get('admin_blocked')) and not student.get('reset_pending'):
             context.user_data.pop('registration',None)
             label='⛔ حسابك موقوف بقرار الإدارة.' if student.get('admin_blocked') else '⏳ تسجيلك محفوظ وبانتظار موافقة الإدارة.'
+            if not student.get('admin_blocked') and not student.get('activation_requested_at'):
+                await send_activation(context.bot,student)
             await update.effective_message.reply_text(label,reply_markup=pending_menu(student))
             return ns['ConversationHandler'].END
         return await previous_start(update,context)
@@ -147,8 +167,8 @@ def install(ns,db):
     async def schedule(q,context):
         student=await db.get_student(q.from_user.id)
         if not student or not student.get('approved') or student.get('study_track')!='chapter':
-            await q.edit_message_text('تعديل الأيام لطلاب الدراسة حسب الفصلات. للدورة جدول الأستاذ.',reply_markup=K([[ns['back_menu']()]]));return
-        days=context.user_data.setdefault('flex_days',list(student.get('study_days') or [0,2,4]))
+            await q.edit_message_text('تعديل الأيام لطلاب الدراسة حسب الفصول. للدورة جدول الأستاذ.',reply_markup=K([[ns['back_menu']()]]));return
+        days=context.user_data.setdefault('flex_days',list(student.get('study_days') or [6,1,3]))
         names=['الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت','الأحد']
         rows=[[B(('✅ ' if i in days else '▫️ ')+name,callback_data=f'flex_day|{i}',style='success' if i in days else 'primary')] for i,name in enumerate(names)]
         rows.extend([[B('💾 حفظ الجدول',callback_data='flex_save',style='success')],[ns['back_menu']()]])
@@ -273,7 +293,7 @@ def install(ns,db):
             except ValueError:await q.answer('يوم غير صالح.');return
             if not 0<=day<=6:await q.answer('يوم غير صالح.');return
             student=await db.get_student(uid)
-            days=context.user_data.setdefault('flex_days',list((student or {}).get('study_days') or [0,2,4]))
+            days=context.user_data.setdefault('flex_days',list((student or {}).get('study_days') or [6,1,3]))
             if day in days:days.remove(day)
             else:days.append(day)
             await q.answer();await schedule(q,context);return

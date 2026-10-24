@@ -44,6 +44,7 @@ def install(ns,db):
   else:
    if not student.get('approved'):rows.append([B('✅ تفعيل يدوي — بدون شرط ولي الأمر',callback_data=f'admin_access|activate|{student_id}',style='success')])
    rows.append([B('⛔ إيقاف حساب الطالب',callback_data=f'admin_access|block|{student_id}',style='danger')])
+  rows.append([B('⚙️ الخانات المفعّلة',callback_data=f'sections|student|{student_id}',style='primary')])
   rows.append([B('👁 عرض واجهة الطالب',callback_data=f'preview_student|{student_id}',style='primary')])
   rows.append([B('◀️ إدارة الطلبة',callback_data='admin_students'),ns['back_menu']()])
   await q.edit_message_text(f"👤 {student.get('full_name') or '-'}\n🆔 {student_id}\n{status}\n👨‍👩‍👦 ولي الأمر: {'مربوط' if student.get('parent_chat_id') else 'غير مربوط'}\n⭐ XP: {student.get('xp',0)}\n⚠️ الإنذارات: {student.get('warnings',0)}",reply_markup=K(rows))

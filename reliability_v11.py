@@ -3,6 +3,7 @@
 Installed last. Migrations preserve existing students, grades and submitted files.
 """
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta
@@ -49,56 +50,8 @@ def install(ns, db):
         return await db.run(op)
 
     def migrate():
-        with db.connect() as conn, conn.cursor() as cur:
-            cur.execute('''ALTER TABLE biology_submissions
-                ADD COLUMN IF NOT EXISTS revision_open BOOLEAN NOT NULL DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS teacher_change_pending BOOLEAN NOT NULL DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS rejected BOOLEAN NOT NULL DEFAULT FALSE;
-                CREATE TABLE IF NOT EXISTS biology_v11_champions (
-                    cohort TEXT PRIMARY KEY, claimed_at TIMESTAMPTZ,
-                    sent_at TIMESTAMPTZ, message_id BIGINT, winner_id BIGINT);
-                CREATE TABLE IF NOT EXISTS biology_v11_submission_history (
-                    id BIGSERIAL PRIMARY KEY, task_id INTEGER NOT NULL, user_id BIGINT NOT NULL,
-                    actor_id BIGINT NOT NULL, action TEXT NOT NULL, snapshot JSONB NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
-                CREATE TABLE IF NOT EXISTS biology_v11_parent_messages (
-                    chat_id BIGINT NOT NULL,message_id BIGINT NOT NULL,parent_id BIGINT NOT NULL,
-                    student_id BIGINT NOT NULL,PRIMARY KEY(chat_id,message_id));
-                ALTER TABLE biology_warning_log ADD COLUMN IF NOT EXISTS policy_key TEXT;
-                CREATE UNIQUE INDEX IF NOT EXISTS biology_v11_warning_policy
-                    ON biology_warning_log(user_id,task_id,policy_key) WHERE policy_key IS NOT NULL;
-                UPDATE biology_warning_log w SET policy_key='failed'
-                    WHERE w.policy_key IS NULL AND w.reason LIKE 'رسوب%%'
-                    AND w.id=(SELECT MIN(w2.id) FROM biology_warning_log w2
-                        WHERE w2.user_id=w.user_id AND w2.task_id=w.task_id AND w2.reason LIKE 'رسوب%%')
-                    AND NOT EXISTS(SELECT 1 FROM biology_warning_log w3 WHERE w3.user_id=w.user_id
-                        AND w3.task_id=w.task_id AND w3.policy_key='failed');
-                CREATE OR REPLACE FUNCTION biology_v11_grade_policy() RETURNS trigger AS $$
-                BEGIN
-                    IF NEW.grade IS NOT NULL AND (NEW.grade<0 OR NEW.grade>100) THEN
-                        RAISE EXCEPTION 'Grade must be between 0 and 100';
-                    END IF;
-                    IF NEW.grade IS NOT NULL AND (NEW.revision_open OR NEW.teacher_change_pending OR NEW.rejected) THEN
-                        RAISE EXCEPTION 'Answer awaiting replacement or rejected';
-                    END IF;
-                    IF NEW.grade IS NOT NULL AND EXISTS(SELECT 1 FROM biology_tasks WHERE id=NEW.task_id AND kind='exam') THEN
-                        PERFORM 1 FROM biology_students WHERE user_id=NEW.user_id FOR UPDATE;
-                        IF NEW.grade<80 THEN
-                            INSERT INTO biology_warning_log(user_id,task_id,reason,issued_by,policy_key)
-                                VALUES(NEW.user_id,NEW.task_id,'رسوب: الدرجة أقل من 80',COALESCE(NEW.graded_by,0),'failed')
-                                ON CONFLICT DO NOTHING;
-                        ELSE
-                            DELETE FROM biology_warning_log WHERE user_id=NEW.user_id AND task_id=NEW.task_id AND policy_key='failed';
-                        END IF;
-                        UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log WHERE user_id=NEW.user_id)
-                            WHERE user_id=NEW.user_id;
-                    END IF;
-                    RETURN NEW;
-                END; $$ LANGUAGE plpgsql;
-                DROP TRIGGER IF EXISTS biology_v11_grade_policy ON biology_submissions;
-                CREATE TRIGGER biology_v11_grade_policy BEFORE INSERT OR UPDATE OF grade ON biology_submissions
-                    FOR EACH ROW EXECUTE FUNCTION biology_v11_grade_policy();''')
-            conn.commit()
+        from assessment_schema import migrate as migrate_schema
+        migrate_schema(db)
 
     old_init = ns['init_db']
     def init_db():
@@ -118,6 +71,8 @@ def install(ns, db):
         await migrate_calendar()
         ns['_V11_COURSE_NAME']=await db.setting_value('v11_course_name') or 'الدورة الحالية'
         app.job_queue.run_repeating(champion_recovery,60,first=40,name='v11_champion_recovery')
+        if ns.get('recover_activation_requests'):
+            app.job_queue.run_repeating(ns['recover_activation_requests'],300,first=50,name='activation_request_recovery')
     ns['post_init'] = post_init
 
     async def open_exempt(task_id, uid):
@@ -162,7 +117,7 @@ def install(ns, db):
                 cur.execute('SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;', (uid,))
                 student = cur.fetchone()
                 if not student or (not teacher and (not student['approved'] or student.get('admin_blocked') or student.get('reset_pending'))): return {'status':'not_allowed'}
-                cur.execute('''SELECT sub.*,GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS until,
+                cur.execute('''SELECT sub.*,t.kind,GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS until,
                     CURRENT_TIMESTAMP AS now FROM biology_submissions sub
                     JOIN biology_tasks t ON t.id=sub.task_id
                     LEFT JOIN biology_task_extensions e ON e.task_id=sub.task_id AND e.user_id=sub.user_id
@@ -170,7 +125,7 @@ def install(ns, db):
                 row = cur.fetchone()
                 denial = retry_denial(row, teacher)
                 if denial: return {'status':denial}
-                if not teacher and row['until']<=row['now']: return {'status':'expired'}
+                if not teacher and row['kind']!='homework' and row['until']<=row['now']: return {'status':'expired'}
                 cur.execute("SELECT 1 FROM biology_submission_delivery_outbox WHERE task_id=%s AND user_id=%s AND status='pending';", (task_id,uid))
                 if cur.fetchone(): return {'status':'pending_delivery'}
                 cur.execute('''INSERT INTO biology_v11_submission_history(task_id,user_id,actor_id,action,snapshot)
@@ -217,7 +172,6 @@ def install(ns, db):
                 cur.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,11));', (key,))
                 cur.execute('SELECT * FROM biology_v11_champions WHERE cohort=%s;', (key,))
                 claim = cur.fetchone()
-                if claim and claim['sent_at']: return None
                 field = 'school_review_id' if task.get('school_review_id') else 'exam_definition_id' if task.get('exam_definition_id') else 'id'
                 cur.execute(f'''SELECT t.id,t.deadline,t.closed,MAX(e.extended_until) AS extension FROM biology_tasks t
                     LEFT JOIN biology_task_extensions e ON e.task_id=t.id
@@ -225,7 +179,7 @@ def install(ns, db):
                     GROUP BY t.id ORDER BY t.id;''', (task[field],))
                 tasks = cur.fetchall()
                 cur.execute('SELECT CURRENT_TIMESTAMP AS now;'); now = cur.fetchone()['now']
-                if not tasks or any(max(t['deadline'],t['extension'] or t['deadline'])>now for t in tasks): return None
+                if not tasks: return None
                 ids = [t['id'] for t in tasks]
                 cur.execute("SELECT 1 FROM biology_submission_delivery_outbox WHERE task_id=ANY(%s) AND status='pending' LIMIT 1;", (ids,))
                 if cur.fetchone(): return None
@@ -235,13 +189,16 @@ def install(ns, db):
                     ORDER BY sub.grade DESC NULLS LAST,sub.submitted_at,sub.user_id;''', (ids,))
                 entries = cur.fetchall()
                 if not entries or any(s['grade'] is None or s['revision_open'] or s['teacher_change_pending'] for s in entries): return None
+                signature=hashlib.sha256(json.dumps([(e['task_id'],e['user_id'],str(e['grade']),str(e['submitted_at'])) for e in entries],sort_keys=True).encode()).hexdigest()
+                if claim and claim.get('sent_at') and claim.get('result_signature')==signature: return None
                 cur.execute('''INSERT INTO biology_v11_champions(cohort,claimed_at) VALUES(%s,CURRENT_TIMESTAMP)
                     ON CONFLICT(cohort) DO UPDATE SET claimed_at=CURRENT_TIMESTAMP
-                    WHERE biology_v11_champions.sent_at IS NULL AND
+                    WHERE
                     (biology_v11_champions.claimed_at IS NULL OR biology_v11_champions.claimed_at<CURRENT_TIMESTAMP-INTERVAL '5 minutes')
                     RETURNING cohort;''', (key,))
                 if not cur.fetchone(): return None
-                conn.commit(); return {**entries[0],'cohort':key,'title':task['title'],'task_ids':ids}
+                conn.commit(); return {**entries[0],'cohort':key,'title':task['title'],'task_ids':ids,
+                    'signature':signature,'previous_message_id':(claim or {}).get('message_id')}
         return await db.run(op)
     db.v11_champion = champion
 
@@ -252,23 +209,42 @@ def install(ns, db):
         winner = await champion(task_id)
         if not winner: return
         try:
-            sent = await context.bot.send_message(ns['BIOLOGY_GROUP_ID'],
-                f"🏆 بطل الامتحان\n\n📝 {winner['title']}\n👤 {winner['full_name']} — {winner['grade']}/100\n\nالأعلى درجة، وعند التعادل الأسبق بإرسال الإجابة المعتمدة.",
-                message_thread_id=ns['CHAMPIONS_TOPIC_ID'])
-            await sql('''UPDATE biology_v11_champions SET sent_at=CURRENT_TIMESTAMP,message_id=%s,winner_id=%s WHERE cohort=%s;''',
-                      (sent.message_id,winner['user_id'],winner['cohort']),commit=True)
+            from homework_v14 import champion_message
+            text=champion_message(winner,ns.get('SUBJECT_NAME','الأحياء'))
+            message_id=winner.get('previous_message_id')
+            if message_id:
+                try:
+                    await context.bot.edit_message_text(text,chat_id=ns['BIOLOGY_GROUP_ID'],message_id=message_id)
+                except ns['TelegramError'] as exc:
+                    if 'message is not modified' not in str(exc).lower(): raise
+            else:
+                sent = await context.bot.send_message(ns['BIOLOGY_GROUP_ID'],text,
+                    message_thread_id=ns['CHAMPIONS_TOPIC_ID'])
+                message_id=sent.message_id
+            await sql('''UPDATE biology_v11_champions SET sent_at=CURRENT_TIMESTAMP,claimed_at=NULL,
+                message_id=%s,winner_id=%s,result_signature=%s WHERE cohort=%s;''',
+                (message_id,winner['user_id'],winner['signature'],winner['cohort']),commit=True)
             await sql('UPDATE biology_tasks SET champion_announced=TRUE WHERE id=ANY(%s);', (winner['task_ids'],),commit=True)
         except ns['TelegramError']:
-            await sql('UPDATE biology_v11_champions SET claimed_at=NULL WHERE cohort=%s AND sent_at IS NULL;', (winner['cohort'],),commit=True)
+            await sql('UPDATE biology_v11_champions SET claimed_at=NULL WHERE cohort=%s;', (winner['cohort'],),commit=True)
             LOG.exception('Champion send failed; retry enabled')
     async def champion_recovery(context):
-        for task in await pending_champions():
-            try: await announce(context,task['id'])
+        for task in await db.closed_exams_pending_champion():
+            try: await ns['announce_champions'](context,task['id'])
             except Exception: LOG.exception('Champion recovery failed for task %s',task['id'])
     ns['announce_champions'] = announce
     async def pending_champions(days=30):
-        return await sql('''SELECT * FROM biology_tasks WHERE kind='exam' AND retired_obligation=FALSE
-            AND champion_announced=FALSE AND deadline<=CURRENT_TIMESTAMP ORDER BY deadline,id;''')
+        return await sql('''SELECT DISTINCT ON (COALESCE('school:'||t.school_review_id::TEXT,
+                'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT)) t.*
+            FROM biology_tasks t
+            LEFT JOIN biology_v11_champions c ON c.cohort=COALESCE('school:'||t.school_review_id::TEXT,
+                'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT)
+            WHERE t.kind='exam' AND t.retired_obligation=FALSE
+            AND EXISTS(SELECT 1 FROM biology_submissions sub WHERE sub.task_id=t.id AND sub.grade IS NOT NULL
+                AND (c.sent_at IS NULL OR c.result_signature IS NULL OR sub.graded_at>c.sent_at
+                    OR sub.submitted_at>c.sent_at))
+            ORDER BY COALESCE('school:'||t.school_review_id::TEXT,
+                'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT),t.id;''')
     db.closed_exams_pending_champion = ns['closed_exams_pending_champion'] = pending_champions
 
     # Keep every distinct menu action, with the student's daily work first.
@@ -312,6 +288,7 @@ def install(ns, db):
 
     old_start = ns['start']
     async def start(update,context):
+        if not update.effective_user: return ns['ConversationHandler'].END
         for key in ('v11_contact','v11_enroll','v11_course_name'): context.user_data.pop(key,None)
         result = await old_start(update,context)
         uid=update.effective_user.id
@@ -443,7 +420,7 @@ def install(ns, db):
                 await q.answer(); await q.edit_message_text('تم الإلغاء. أرسل /start للقائمة.'); return
             if action=='course':
                 title=await db.setting_value('v11_course_name') or 'الدورة الحالية'
-                await q.answer(); await q.edit_message_text(f'🗓 {title}\nالأيام الافتراضية: الأحد والاثنين والثلاثاء؛ الثلاثاء محاضرتان.\nيمكن تعديل كل محاضرة واسمها وموعدها، وإضافة أو حذف محاضرات من محرر الجدول.',reply_markup=K([
+                await q.answer(); await q.edit_message_text(f'🗓 {title}\nالأيام الافتراضية: الاثنين والثلاثاء والخميس؛ بنفس مجموعات المحاضرات الأصلية.\nيمكن تعديل كل محاضرة واسمها وموعدها، وإضافة أو حذف محاضرات من محرر الجدول.',reply_markup=K([
                     [B('✏️ تغيير اسم الدورة',callback_data='v11|course_name')],
                     [B('🗓 تحرير الجدول والمحاضرات',callback_data='ctl_calendar')],[ns['back_menu']()]])); return
             if action=='course_name':
@@ -454,7 +431,9 @@ def install(ns, db):
     ns['button_handler']=button
 
     async def input_message(update,context):
-        msg=update.effective_message; uid=update.effective_user.id
+        msg=update.effective_message
+        if not msg or not update.effective_user: return False
+        uid=update.effective_user.id
         state=context.user_data.get('v11_enroll') if admin(uid) else None
         if state:
             if datetime.now(ZONE)-state['at']>timedelta(minutes=20):

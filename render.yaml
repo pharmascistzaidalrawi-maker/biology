@@ -68,7 +68,7 @@ services:
       - key: USE_DATABASE_INSTANCE_LOCK
         value: "0"
       - key: DEFAULT_HOMEWORK_HOURS
-        value: "24"
+        value: "48"
       - key: MIN_LECTURE_WATCH_MINUTES
         value: "30"
       - key: ACTIVATION_GRACE_HOURS

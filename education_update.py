@@ -1,4 +1,4 @@
-"""Chemistry weekly exams, editable school reviews and private guardian messaging."""
+"""Biology weekly exams, editable school reviews and private guardian messaging."""
 import json
 import time
 from datetime import datetime, date, time as clock, timedelta
@@ -6,14 +6,15 @@ from zoneinfo import ZoneInfo
 
 ZONE=ZoneInfo('Asia/Baghdad')
 
-def next_exam_day(day):
-    return day+timedelta(days=(4-day.weekday())%7)
+def thursday(day):
+    return day+timedelta(days=(3-day.weekday())%7)
 
 def week_start(day):
     return day-timedelta(days=(day.weekday()+1)%7)
 
 def exam_window(day):
-    start=datetime.combine(day,clock(11),ZONE)
+    if day.weekday()!=3:raise ValueError('اختر تاريخ يوم خميس.')
+    start=datetime.combine(day,clock(),ZONE)
     return start,start+timedelta(days=1)
 
 def parse_lectures(text,catalog):
@@ -36,9 +37,9 @@ def lecture_text(pairs):
 
 def announcement(row):
     return (f"✦ {row['title']} ✦\n━━━━━━━━━━━━━━━━━━\n"
-            f"🔸 موعد امتحانات الأسبوع | {row['exam_date']:%d/%m/%Y}\n\n"
+            f"🔸 امتحان يوم الخميس | {row['exam_date']:%d/%m/%Y}\n\n"
             f"{lecture_text(row['lectures'])}\n\n{row.get('topics') or ''}\n"
-            '⏳ الامتحانات المرتبطة متاحة من 11 صباحاً لمدة 24 ساعة بتوقيت بغداد.\n━━━━━━━━━━━━━━━━━━')
+            '⏳ الامتحانات متاحة يوم الخميس من 00:00 حتى نهاية اليوم بتوقيت بغداد.\n━━━━━━━━━━━━━━━━━━')
 
 async def sql(db,query,args=(),one=False,write=False):
     def op():
@@ -55,7 +56,7 @@ def migrate(db):
             ADD COLUMN IF NOT EXISTS selected_lectures JSONB NOT NULL DEFAULT '[]',
             ADD COLUMN IF NOT EXISTS content_revision INTEGER NOT NULL DEFAULT 1;
         CREATE TABLE IF NOT EXISTS biology_weekly_plans(
-            id SERIAL PRIMARY KEY,exam_date DATE NOT NULL UNIQUE,
+            id SERIAL PRIMARY KEY,exam_date DATE NOT NULL UNIQUE CHECK(EXTRACT(ISODOW FROM exam_date)=4),
             title TEXT NOT NULL DEFAULT 'امتحانات هذا الأسبوع',topics TEXT NOT NULL DEFAULT '',
             lectures JSONB NOT NULL DEFAULT '[]',published BOOLEAN NOT NULL DEFAULT FALSE,
             revision INTEGER NOT NULL DEFAULT 1,created_by BIGINT NOT NULL);
@@ -95,11 +96,7 @@ async def school_edit(db,rid,field,value,actor):
     return await db.run(op)
 
 async def save_week(db,pid,field,value,actor):
-    if field not in {'title','topics','lectures','exam_date'}:raise ValueError('حقل غير صالح')
-    if field=='exam_date':
-        if value<datetime.now(ZONE).date():raise ValueError('اختر موعداً قادماً.')
-        conflict=await sql(db,'SELECT id FROM biology_weekly_plans WHERE exam_date=%s AND id<>%s;',(value,pid),True)
-        if conflict:raise ValueError('الموعد مستخدم بأسبوع آخر.')
+    if field not in {'title','topics','lectures'}:raise ValueError('حقل غير صالح')
     return await sql(db,f"UPDATE biology_weekly_plans SET {field}=%s"+('::jsonb' if field=='lectures' else '')+",published=FALSE,revision=revision+1 WHERE id=%s RETURNING *;",
         (json.dumps(value) if field=='lectures' else value,pid),True,True)
 
@@ -109,12 +106,12 @@ async def publish_week(db,pid,actor):
             cur.execute('SELECT * FROM biology_weekly_plans WHERE id=%s FOR UPDATE;',(pid,));row=cur.fetchone()
             if not row or not row['lectures']:raise ValueError('حدد المحاضرات قبل النشر.')
             start,end=exam_window(row['exam_date'])
-            if end<=datetime.now(ZONE):raise ValueError('انتهى هذا الموعد. اختر أسبوعاً قادماً.')
+            if end<=datetime.now(ZONE):raise ValueError('انتهى هذا الخميس. اختر أسبوعاً قادماً.')
             cur.execute('SELECT definition_id FROM biology_weekly_exam_links WHERE plan_id=%s;',(pid,));ids=[r['definition_id'] for r in cur.fetchall()]
             covered={tuple(x) for x in row['lectures']}
             for did in ids:
                 required=set(db._v52_required_lectures(cur,did))
-                if not required or not required<=covered:raise ValueError('محاضرات أحد الامتحانات المرتبطة غير موجودة في التبليغ. عدل المحاضرات أو ايونت الامتحان.')
+                if not required or not required<=covered:raise ValueError('محاضرات أحد الامتحانات المرتبطة غير موجودة في التبليغ. عدل المحاضرات أو افصل الامتحان.')
                 cur.execute('''SELECT 1 FROM biology_tasks WHERE exam_definition_id=%s
                     AND (exam_available_at<=CURRENT_TIMESTAMP OR EXISTS(SELECT 1 FROM biology_submissions WHERE task_id=biology_tasks.id)) LIMIT 1;''',(did,))
                 if cur.fetchone():raise ValueError('أحد الامتحانات بدأ بالفعل. لا يمكن نقل موعده من هنا.')
@@ -154,10 +151,25 @@ def install(ns,db):
     old_init=db.init_db
     def init_db():old_init();migrate(db)
     db.init_db=init_db;ns['init_db']=init_db
+    old_window=db._v48_course_window
+    def course_window(cur,d):
+        result=old_window(cur,d)
+        if not d or d.get('target_scope')!='course' or result.get('status')!='ready':return result
+        # Existing attempts retain their saved deadlines. Newly scheduled course exams use Thursday.
+        saved=d.get('actual_publish_at') or d.get('manual_publish_at')
+        if saved and saved<=datetime.now(ZONE):return result
+        start,end=exam_window(thursday(result['publish_at'].astimezone(ZONE).date()))
+        if d.get('manual_publish_at'):
+            cur.execute('UPDATE biology_linked_exam_definitions SET manual_publish_at=%s,manual_deadline=%s WHERE id=%s;',(start,end,d['id']))
+        else:
+            cur.execute('UPDATE biology_linked_exam_definitions SET actual_publish_at=%s,actual_deadline=%s WHERE id=%s;',(start,end,d['id']))
+        return {'status':'ready','publish_at':start,'deadline':end}
+    db._v48_course_window=course_window
+
     old_menu=ns['main_menu']
     def main_menu(admin=False):
         rows=[list(r) for r in old_menu(admin).inline_keyboard]
-        if admin:rows.insert(1,[B('📅 إدارة الامتحانات الأسبوعية',callback_data='edu_weeks',style='primary')])
+        if admin:rows.insert(1,[B('📅 إدارة امتحانات الخميس',callback_data='edu_weeks',style='primary')])
         else:rows.insert(0,[B('📚 خطتي الدراسية',callback_data='edu_plan',style='success')])
         return K(rows)
     ns['main_menu']=main_menu
@@ -172,7 +184,7 @@ def install(ns,db):
     ns['_v54_school_review_text']=school_text
     old_school_admin=ns['v54_school_admin_review']
     async def school_admin(q,rid):
-        rows=[[B('✏️ اسم الأسبوع',callback_data=f'edu_school|{rid}|week_label'),B('✏️ الفصلات الداخلة',callback_data=f'edu_school|{rid}|chapter_label')],
+        rows=[[B('✏️ اسم الأسبوع',callback_data=f'edu_school|{rid}|week_label'),B('✏️ الفصول الداخلة',callback_data=f'edu_school|{rid}|chapter_label')],
               [B('✏️ تعديل الموضوعات',callback_data=f'edu_school|{rid}|topics'),B('🎬 تعديل المحاضرات',callback_data=f'edu_school|{rid}|selected_lectures')]]
         return await old_school_admin(MarkupProxy(q,rows,K),rid)
     ns['v54_school_admin_review']=school_admin
@@ -181,10 +193,10 @@ def install(ns,db):
         row=await sql(db,'SELECT * FROM biology_weekly_plans WHERE id=%s;',(pid,),True)
         if not row:await q.edit_message_text('الأسبوع غير موجود.');return
         linked=await sql(db,'SELECT definition_id FROM biology_weekly_exam_links WHERE plan_id=%s;',(pid,))
-        rows=[[B('📅 تغيير موعد الامتحان',callback_data=f'edu_weekfield|{pid}|exam_date')], [B('✏️ العنوان',callback_data=f'edu_weekfield|{pid}|title'),B('✏️ الموضوعات',callback_data=f'edu_weekfield|{pid}|topics')],
+        rows=[[B('✏️ العنوان',callback_data=f'edu_weekfield|{pid}|title'),B('✏️ الموضوعات',callback_data=f'edu_weekfield|{pid}|topics')],
               [B('🎬 تحديد المحاضرات',callback_data=f'edu_weekfield|{pid}|lectures')],
               [B(f'📝 ربط الامتحانات ({len(linked)})',callback_data=f'edu_linkmenu|{pid}|0')],
-              [B('📢 نشر التبليغ واعتماد الموعد',callback_data=f'edu_publish|{pid}',style='success')],
+              [B('📢 نشر التبليغ وحفظ موعد الخميس',callback_data=f'edu_publish|{pid}',style='success')],
               [B('🗑 سحب التبليغ',callback_data=f'edu_unpublish|{pid}',style='danger')]]
         await q.edit_message_text(announcement(row)+('\n✅ منشور' if row['published'] else '\n✏️ مسودة'),reply_markup=kb(rows))
 
@@ -197,6 +209,8 @@ def install(ns,db):
 
     old_daily=ns['v51_daily_tasks_menu']
     async def daily(q):
+        if hasattr(db,'section_enabled') and not await db.section_enabled(q.from_user.id,'lectures'):
+            return await old_daily(q)
         rows=await current_week(q.from_user.id)
         progress=await db.v52_progress_overview(q.from_user.id)
         if not progress.get('student'):return await old_daily(q)
@@ -204,7 +218,7 @@ def install(ns,db):
         done=sum(len({int(x) for x in completed.get(ch,[])} & {int(v[0]) for v in vals}) for ch,vals in ns['PLAYLISTS'].items())
         footer=f'\n\n📊 إنجاز المنهج: {round(done*100/total) if total else 0}% — المتبقي {max(0,total-done)} محاضرة.'
         if progress.get('finish_date'):footer+=f"\n🏁 الإكمال المتوقع: {progress['finish_date']:%d/%m/%Y}"
-        if rows:footer+='\n\n📅 امتحانات الأسبوع:\n'+lecture_text(rows[0]['lectures'])
+        if rows:footer+='\n\n📅 امتحان الخميس القادم:\n'+lecture_text(rows[0]['lectures'])
         footer+='\n\n💪 ابدأ بالمحاضرة الحالية، ثم امتحانها والواجب، ثم المراجعة. كل خطوة مكتملة تقرّبك من هدفك.'
         class DailyProxy(MarkupProxy):
             async def edit_message_text(self,text,*args,**kwargs):
@@ -262,18 +276,17 @@ def install(ns,db):
             return await compose_thread(q,context,row['id'])
         if data.startswith(('edu_school|','edu_weekfield|')):
             action,rid,field=data.split('|');rid=int(rid)
-            allowed={'week_label','chapter_label','topics','selected_lectures'} if action=='edu_school' else {'title','topics','lectures','exam_date'}
+            allowed={'week_label','chapter_label','topics','selected_lectures'} if action=='edu_school' else {'title','topics','lectures'}
             if field not in allowed:await q.answer('حقل غير صالح.');return
             context.user_data['edu_input']={'kind':'school' if action=='edu_school' else 'week','id':rid,'field':field,'at':time.monotonic()}
             hint='أرسل المحاضرات بهذه الصيغة: 4:1,2,3;5:1\nأي الفصل الرابع محاضرات 1+2+3 والخامس محاضرة 1.' if field in {'lectures','selected_lectures'} else 'أرسل النص الجديد كاملاً (سيستبدل النص القديم):'
-            if field=='exam_date':hint='أرسل موعد الامتحان بصيغة 09/10/2026. لا يطبق على الامتحانات المرتبطة حتى تعيد نشر التبليغ.'
             await q.answer();await q.edit_message_text(hint,reply_markup=kb([[B('إلغاء',callback_data='edu_cancel')]]));return
         if data=='edu_weeks':
-            today=datetime.now(ZONE).date();day=next_exam_day(today)
-            rows=[[B(f'📅 {d:%d/%m/%Y}',callback_data=f'edu_newweek|{d.isoformat()}')] for d in [day,day+timedelta(days=7),day+timedelta(days=14)]]
+            today=datetime.now(ZONE).date();day=thursday(today)
+            rows=[[B(f'📅 الخميس {d:%d/%m/%Y}',callback_data=f'edu_newweek|{d.isoformat()}')] for d in [day,day+timedelta(days=7),day+timedelta(days=14)]]
             existing=await sql(db,'SELECT id,title,exam_date FROM biology_weekly_plans ORDER BY exam_date DESC LIMIT 12;')
             rows.extend([[B(f"✏️ {r['title']} — {r['exam_date']:%d/%m}",callback_data=f"edu_week|{r['id']}")] for r in existing])
-            await q.answer();await q.edit_message_text('📅 إدارة الامتحانات الأسبوعية\nاختر الأسبوع، ثم حدد المحاضرات واربط الامتحانات وانشر التبليغ.',reply_markup=kb(rows));return
+            await q.answer();await q.edit_message_text('📅 إدارة امتحانات الخميس\nاختر الأسبوع، ثم حدد المحاضرات واربط الامتحانات وانشر التبليغ.',reply_markup=kb(rows));return
         if data.startswith('edu_newweek|'):
             day=date.fromisoformat(data.split('|')[1]);exam_window(day)
             row=await sql(db,'''INSERT INTO biology_weekly_plans(exam_date,created_by) VALUES(%s,%s)
@@ -346,7 +359,6 @@ def install(ns,db):
         if not text or len(text)>limit:await msg.reply_text(f'أرسل نصاً من 1 إلى {limit} حرف.');return
         try:
             value=parse_lectures(text,ns['PLAYLISTS']) if state['field'] in {'lectures','selected_lectures'} else text
-            if state['field']=='exam_date':value=datetime.strptime(text,'%d/%m/%Y').date()
             if state['kind']=='school':result=await school_edit(db,state['id'],state['field'],value,uid)
             else:result=await save_week(db,state['id'],state['field'],value,uid)
         except (ValueError,TypeError):await msg.reply_text('القيمة غير صالحة. للمحاضرات استخدم: 4:1,2,3;5:1');return
@@ -377,7 +389,7 @@ def install(ns,db):
         sent={(r['event_key'],r['user_id']) for r in await sql(db,'SELECT event_key,user_id FROM biology_education_deliveries WHERE event_key=ANY(%s) AND sent=TRUE;',(keys,))}
         for student in students:
             uid=student['user_id']
-            if student['study_track']=='course':
+            if student['study_track']=='course' and (not hasattr(db,'section_enabled') or await db.section_enabled(uid,'exams')):
                 for plan in plans:
                     key=f"week:{plan['id']}:{plan['revision']}"
                     if (key,uid) not in sent:await deliver_once(context,uid,key,announcement(plan),kb([[B('📅 امتحانات هذا الأسبوع',callback_data='edu_weekly')]]))

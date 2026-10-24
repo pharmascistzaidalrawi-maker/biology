@@ -1,9 +1,10 @@
+from data import CHAPTER_COUNT
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import asyncio
 import os
 import threading
-from datetime import date, timedelta
+from datetime import timedelta
 
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
@@ -40,7 +41,7 @@ def _pool():
                     timeout=DB_CONNECT_TIMEOUT,max_idle=DB_POOL_MAX_IDLE,max_lifetime=900,
                     kwargs={"sslmode":"require","row_factory":dict_row,"connect_timeout":DB_CONNECT_TIMEOUT},
                     check=ConnectionPool.check_connection,
-                    open=True,name="physics-neon-pool")
+                    open=True,name="biology-neon-pool")
     return _DB_POOL
 
 
@@ -221,7 +222,7 @@ def init_db():
             payload_type TEXT NOT NULL,
             file_id TEXT NOT NULL,
             publish_at TIMESTAMPTZ NOT NULL,
-            submission_hours INTEGER NOT NULL CHECK(submission_hours BETWEEN 1 AND 720),
+            submission_hours INTEGER NOT NULL CHECK(submission_hours BETWEEN 1 AND 520),
             created_by BIGINT NOT NULL,
             published BOOLEAN NOT NULL DEFAULT FALSE,
             published_message_id BIGINT,
@@ -332,6 +333,10 @@ def init_db():
         ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS track_started_on DATE;
         ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS schedule_mode TEXT NOT NULL DEFAULT 'regular';
         ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS study_days INTEGER[] NOT NULL DEFAULT ARRAY[1,3,5,6];
+        ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS activation_requested_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS admin_manual_active BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS admin_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS admin_access_previous_approval BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE biology_students ADD COLUMN IF NOT EXISTS schedule_change_count INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE biology_personal_preparations ADD COLUMN IF NOT EXISTS prep_no INTEGER;
         ALTER TABLE biology_scheduled_tasks ADD COLUMN IF NOT EXISTS linked_chapter INTEGER;
@@ -480,7 +485,7 @@ async def register_student(user_id, username, full_name, school, target_grade):
 async def set_student_approval(user_id, approved):
     def op():
         with connect() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE biology_students SET approved=%s,last_seen=CURRENT_TIMESTAMP WHERE user_id=%s RETURNING *;",(approved,user_id)); row=cur.fetchone(); conn.commit(); return row
+            cur.execute("UPDATE biology_students SET approved=CASE WHEN admin_blocked THEN FALSE ELSE %s END,last_seen=CURRENT_TIMESTAMP WHERE user_id=%s RETURNING *;",(approved,user_id)); row=cur.fetchone(); conn.commit(); return row
     return await run(op)
 
 
@@ -654,8 +659,10 @@ async def linked_exam_definition_status(definition_id,user_id):
             for r in lectures:
                 cur.execute("SELECT 1 FROM biology_lecture_progress WHERE user_id=%s AND chapter=%s AND lecture=%s AND completed_at IS NOT NULL;",(user_id,r["chapter"],r["lecture"]))
                 if not cur.fetchone(): missing.append(r)
+            if not _section_lectures_required(cur,user_id): missing=[]
             return {"ready":not missing,"missing":missing,"lectures":lectures,"student":st,"definition":definition}
     return await run(op)
+
 
 
 
@@ -704,14 +711,6 @@ async def activate_exam(task_id,user_id,approved_by,hours=None):
             effective_hours=max(1,int(hours or current.get('exam_duration_hours') or 24))
             now=datetime_now(cur);deadline=now+timedelta(hours=effective_hours)
             available=now
-            if current.get('exam_definition_id'):
-                # Approval grants access; it must not silently reschedule a published exam.
-                available=current.get('exam_available_at') or now
-                deadline=current['deadline']
-                cur.execute('SELECT extended_until FROM biology_task_extensions WHERE task_id=%s AND user_id=%s;', (task_id,user_id))
-                extension=cur.fetchone()
-                effective_deadline=max(deadline,extension['extended_until']) if extension else deadline
-                if current.get('closed') or available>now or effective_deadline<=now: return None
             if current.get('school_review_id'):
                 cur.execute('SELECT * FROM biology_school_reviews WHERE id=%s FOR UPDATE;',(current['school_review_id'],))
                 review=cur.fetchone()
@@ -719,10 +718,20 @@ async def activate_exam(task_id,user_id,approved_by,hours=None):
                 available=review.get('exam_opens_at') or current.get('exam_available_at') or now
                 deadline=review.get('exam_closes_at') or current['deadline']
                 if available>now or deadline<=now: return None
+            elif current.get('exam_definition_id'):
+                cur.execute('SELECT target_scope FROM biology_linked_exam_definitions WHERE id=%s;',(current['exam_definition_id'],))
+                definition=cur.fetchone()
+                if definition and definition['target_scope']=='course' and not current.get('optional_practice'):
+                    # Parent approval preserves the shared course window, including Thursday-only exams.
+                    available=current.get('exam_available_at') or now
+                    deadline=current['deadline']
+                    if deadline<=now:return None
             cur.execute("""UPDATE biology_tasks SET exam_pending_activation=FALSE,deadline=%s,closed=FALSE,
                 exam_available_at=%s,published_at=COALESCE(published_at,%s)
                 WHERE id=%s RETURNING *;""",(deadline,available,now,task_id));task=cur.fetchone()
-            cur.execute("UPDATE biology_exam_access SET status='approved',approved_by=%s,approved_at=CURRENT_TIMESTAMP WHERE task_id=%s AND user_id=%s;",(approved_by,task_id,user_id))
+            cur.execute("""INSERT INTO biology_exam_access(approved_by,task_id,user_id,status,approved_at)
+                VALUES(%s,%s,%s,'approved',CURRENT_TIMESTAMP) ON CONFLICT(task_id,user_id)
+                DO UPDATE SET status='approved',approved_by=EXCLUDED.approved_by,approved_at=CURRENT_TIMESTAMP;""",(approved_by,task_id,user_id))
             conn.commit();return task
     return await run(op)
 
@@ -960,20 +969,11 @@ async def get_student_by_parent_code(code):
 async def seed_preparations(rows):
     def op():
         with connect() as conn, conn.cursor() as cur:
-            # Remove only the preparations preceding the official course start.
-            # Their lectures remain available normally in the chapter library.
-            cur.execute("""DELETE FROM biology_preparations
-                WHERE chapter<3 OR (chapter=3 AND chapter_prep_no<11);""")
-            cur.execute("""DELETE FROM biology_early_preparation_unlocks
-                WHERE chapter<3 OR (chapter=3 AND EXISTS(
-                    SELECT 1 FROM UNNEST(STRING_TO_ARRAY(lectures,',')) value
-                    WHERE value::INTEGER<11));""")
+            cur.execute("SELECT value FROM biology_settings WHERE key IN ('biology_v11_calendar_done','admin_course_calendar') AND value='1' LIMIT 1;")
+            if cur.fetchone():return
             for prep_no,target_date,lectures,chapter,chapter_prep_no in rows:
                 cur.execute("""INSERT INTO biology_preparations(prep_no,target_date,lectures,chapter,chapter_prep_no)
-                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(prep_no) DO UPDATE SET
-                target_date=EXCLUDED.target_date,lectures=EXCLUDED.lectures,
-                chapter=EXCLUDED.chapter,chapter_prep_no=EXCLUDED.chapter_prep_no
-                WHERE biology_preparations.published=FALSE;""",
+                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(prep_no) DO NOTHING;""",
                 (prep_no,target_date,lectures,chapter,chapter_prep_no))
             conn.commit()
     await run(op)
@@ -1010,7 +1010,7 @@ async def latest_preparation():
 
 
 def _next_study_date(value, days=None):
-    allowed=set(days or (1,3,5,6))
+    allowed=set(days or (1,3,6))
     value+=timedelta(days=1)
     while value.weekday() not in allowed: value+=timedelta(days=1)
     return value
@@ -1018,7 +1018,7 @@ def _next_study_date(value, days=None):
 
 def _previous_study_date(value):
     value-=timedelta(days=1)
-    while value.weekday() not in (1,3,5,6): value-=timedelta(days=1)
+    while value.weekday() not in (1,3,6): value-=timedelta(days=1)
     return value
 
 
@@ -1058,6 +1058,9 @@ async def create_task(kind,title,chat_id,thread_id,message_id,payload_type,file_
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(chat_id,source_message_id) DO UPDATE SET title=EXCLUDED.title,deadline=EXCLUDED.deadline,target_scope=EXCLUDED.target_scope
             RETURNING *;""",(kind,title,chat_id,thread_id,message_id,payload_type,file_id,media_group_id,text_content,deadline,xp_reward,created_by,target_scope,linked_lectures)); row=cur.fetchone()
+            if kind=='homework':
+                from homework_v14 import finalize_homework
+                row=finalize_homework(cur,row)
             if file_id: cur.execute("INSERT INTO biology_task_media(task_id,payload_type,file_id,source_message_id) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING;",(row["id"],payload_type,file_id,message_id))
             if target_scope.startswith("student:"):
                 only_id=int(target_scope.split(":",1)[1])
@@ -1369,7 +1372,7 @@ async def create_pending_task(kind,title,chat_id,thread_id,message_id,payload_ty
 
 
 async def set_pending_task_scope(pending_id,target_scope):
-    if target_scope not in {"all","course",*(f"chapter_{chapter}" for chapter in range(1,6))}: return None
+    if target_scope not in {"all","course",*(f"chapter_{ch}" for ch in range(1,CHAPTER_COUNT+1))}: return None
     def op():
         with connect() as conn, conn.cursor() as cur:
             cur.execute("UPDATE biology_pending_tasks SET target_scope=%s WHERE id=%s RETURNING *;",(target_scope,pending_id)); row=cur.fetchone(); conn.commit(); return row
@@ -1396,8 +1399,14 @@ async def get_pending_task(pending_id):
 async def confirm_pending_task(pending_id,deadline):
     def op():
         with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(140048);")
             cur.execute("SELECT * FROM biology_pending_tasks WHERE id=%s FOR UPDATE;",(pending_id,)); p=cur.fetchone()
             if not p: return None
+            if p['kind']=='homework':
+                from homework_v14 import reserve_number
+                p=reserve_number(cur,p)
+                title=p['title']
+                deadline=(p.get('homework_published_at') or p['created_at'])+timedelta(hours=48)
             reward=30 if p["kind"]=="homework" else 20
             cur.execute("""INSERT INTO biology_tasks
             (kind,title,chat_id,thread_id,source_message_id,payload_type,file_id,media_group_id,text_content,deadline,xp_reward,created_by,target_scope)
@@ -1405,6 +1414,9 @@ async def confirm_pending_task(pending_id,deadline):
             ON CONFLICT(chat_id,source_message_id) DO UPDATE SET title=EXCLUDED.title,deadline=EXCLUDED.deadline,target_scope=EXCLUDED.target_scope
             RETURNING *;""",(p["kind"],p["title"],p["chat_id"],p["thread_id"],p["source_message_id"],p["payload_type"],p["file_id"],p["media_group_id"],p["text_content"],deadline,reward,p["created_by"],p["target_scope"]))
             task=cur.fetchone()
+            if p['kind']=='homework':
+                from homework_v14 import finalize_homework
+                task=finalize_homework(cur,task,p['homework_number'],p.get('homework_published_at') or p['created_at'])
             cur.execute("""INSERT INTO biology_task_media(task_id,payload_type,file_id,source_message_id)
             SELECT %s,payload_type,file_id,source_message_id FROM biology_pending_task_media WHERE pending_id=%s
             ON CONFLICT DO NOTHING;""",(task["id"],pending_id))
@@ -1479,14 +1491,14 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
     def op():
         with connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,));student=cur.fetchone()
-            if not student or not student['approved'] or student.get('reset_pending'): return "not_allowed"
+            if not student or not student['approved'] or student.get('reset_pending') or student.get('admin_blocked'): return "not_allowed"
             cur.execute("""SELECT t.*,GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS effective_deadline,
                 e.extended_until FROM biology_tasks t
                 JOIN biology_task_students ts ON ts.task_id=t.id AND ts.user_id=%s
                 LEFT JOIN biology_task_extensions e ON e.task_id=t.id AND e.user_id=%s
                 LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
-                WHERE t.id=%s AND (d.id IS NULL OR d.deleted_at IS NULL) FOR UPDATE OF t;""",(user_id,user_id,task_id));eligible=cur.fetchone()
-            if not eligible or eligible.get('exam_pending_activation'): return "not_allowed"
+                WHERE t.id=%s AND t.retired_obligation=FALSE AND (d.id IS NULL OR d.deleted_at IS NULL) FOR UPDATE OF t;""",(user_id,user_id,task_id));eligible=cur.fetchone()
+            if not eligible: return "not_allowed"
             # Use the timestamp when Telegram originally received a valid
             # answer, not the later retry time. A Telegram topic outage must
             # never make a previously accepted answer "late".
@@ -1500,10 +1512,13 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
                 now=queued['created_at']
             else:
                 cur.execute("SELECT clock_timestamp() AS now;");now=cur.fetchone()['now']
-            if eligible['effective_deadline']<=now: return "expired"
-            if eligible.get('closed') and not queued and not (eligible.get('extended_until') and eligible['extended_until']>now): return "not_allowed"
+            from student_sections_schema import task_allowed
+            if not queued and not task_allowed(cur,user_id,eligible,'biology'): return 'not_allowed'
+            if eligible["kind"]!="homework" and eligible['effective_deadline']<=now: return "expired"
+            if eligible["kind"]=="homework" and (eligible.get("homework_manual_closed") or (eligible.get("homework_opens_at") and eligible["homework_opens_at"]>now)): return "not_allowed"
+            if eligible['kind']!='homework' and eligible.get('closed') and not queued and not (eligible.get('extended_until') and eligible['extended_until']>now): return "not_allowed"
             if eligible.get('exam_available_at') and eligible['exam_available_at']>now: return "not_allowed"
-            if eligible.get('exam_approval_required'):
+            if eligible.get('exam_approval_required') or eligible.get('exam_pending_activation'):
                 cur.execute("SELECT 1 FROM biology_exam_access WHERE task_id=%s AND user_id=%s AND status='approved';",(task_id,user_id))
                 if not cur.fetchone(): return "not_allowed"
             if file_unique_id:
@@ -1534,9 +1549,13 @@ async def record_submission(task_id,user_id,message_id,file_unique_id,media_grou
                 # valid late submission is accepted.
                 cur.execute("""DELETE FROM biology_warning_log WHERE id IN
                 (SELECT id FROM biology_warning_log WHERE task_id=%s AND user_id=%s
-                 AND reason LIKE 'عدم إرسال%%' ORDER BY created_at LIMIT 1) RETURNING id;""",(task_id,user_id))
+                 AND reason LIKE 'عدم إرسال%%' AND COALESCE(issued_by,0)=0 ORDER BY created_at LIMIT 1) RETURNING id;""",(task_id,user_id))
                 if cur.fetchone():
                     cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-1) WHERE user_id=%s;",(user_id,))
+            if eligible['kind']=='homework':
+                cur.execute("""DELETE FROM biology_warning_log WHERE task_id=%s AND user_id=%s
+                    AND COALESCE(issued_by,0)=0 AND reason LIKE 'عدم إرسال%%';""",(task_id,user_id))
+                cur.execute("UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log WHERE user_id=%s) WHERE user_id=%s;",(user_id,user_id))
             if queued:
                 cur.execute("""UPDATE biology_submissions SET submitted_at=%s
                     WHERE task_id=%s AND user_id=%s;""",(now,task_id,user_id))
@@ -1705,7 +1724,7 @@ async def request_extension(task_id,user_id,hours=24):
             WHERE user_id=%s AND requested_at>=DATE_TRUNC('week',CURRENT_TIMESTAMP);""",(user_id,)); used=cur.fetchone()["n"]
             if used>=2: return {"status":"limit","used":used}
             cur.execute("SELECT deadline,closed FROM biology_tasks WHERE id=%s;",(task_id,)); task=cur.fetchone()
-            if not task or task["closed"] or task["deadline"]<=datetime_now(cur): return {"status":"closed"}
+            if not task or task["closed"]: return {"status":"closed"}
             extended_until=max(task["deadline"],datetime_now(cur))+timedelta(hours=min(24,max(1,hours)))
             cur.execute("""INSERT INTO biology_task_extensions(task_id,user_id,extended_until) VALUES(%s,%s,%s)
             ON CONFLICT(task_id,user_id) DO NOTHING RETURNING *;""",(task_id,user_id,extended_until)); row=cur.fetchone()
@@ -1877,7 +1896,20 @@ async def lecture_progress(user_id,chapter,lecture):
 
 
 async def lecture_opened_in_assigned_preparation(user_id,chapter,lecture):
-    """Keep an already opened lecture finishable when the next prep is published."""
+    """Validate against the live edited assignment, then historical published access.
+
+    An opened timestamp is required on both paths. A calendar edit can replace
+    the old publication dates, so those dates must not reject today's assignment.
+    """
+    student=await get_student(int(user_id))
+    if not student or not student.get('approved') or student.get('reset_pending') or student.get('admin_blocked'):
+        return False
+    progress=await lecture_progress(int(user_id),int(chapter),int(lecture))
+    if not progress or not progress.get('opened_at'):
+        return False
+    access=await v37_preparation_access(int(user_id),int(chapter),int(lecture))
+    if access.get('allowed'):
+        return True
     def op():
         with connect() as conn, conn.cursor() as cur:
             cur.execute("""SELECT s.study_track,s.track_started_on,lp.opened_at
@@ -2225,10 +2257,11 @@ async def buy_remove_warning(user_id):
             if s["xp"]<500: return "xp"
             cur.execute("DELETE FROM biology_warning_log WHERE id=(SELECT id FROM biology_warning_log WHERE user_id=%s ORDER BY created_at DESC LIMIT 1) RETURNING id,task_id;",(user_id,)); deleted=cur.fetchone()
             if not deleted: return "none"
-            if deleted.get("task_id"):
+            if deleted.get('task_id'):
                 cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
                     SELECT id,%s,0 FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
-                    (user_id,deleted["task_id"]))
+                    (user_id,deleted['task_id']))
+                cur.execute("INSERT INTO biology_exam_warning_waivers(task_id,user_id,waived_by) VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO NOTHING;",(deleted['task_id'],user_id,0))
             cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
                 WHERE user_id=%s) WHERE user_id=%s;""",(user_id,user_id))
             _set_xp_event(cur,user_id,-500,"فك إنذار واحد",f"unwarn-purchase:{user_id}:{deleted['id']}")
@@ -2455,21 +2488,15 @@ async def add_warning(user_id,reason,issued_by=0,task_id=None):
         with connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT warnings FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
             if not student: return 0
-            if task_id:
-                cur.execute("SELECT exam_difficulty FROM biology_tasks WHERE id=%s;",(task_id,))
-                exam=cur.fetchone()
-                if exam and exam.get('exam_difficulty')=='hard':
-                    cur.execute("SELECT warnings FROM biology_students WHERE user_id=%s;",(user_id,))
-                    student=cur.fetchone(); return student['warnings'] if student else 0
             if task_id and int(issued_by or 0)==0:
                 cur.execute("SELECT 1 FROM biology_v9_deleted_task_warnings WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
-                if cur.fetchone():
-                    return student["warnings"]
+                if cur.fetchone(): return student["warnings"]
             if task_id:
                 cur.execute("SELECT 1 FROM biology_warning_log WHERE user_id=%s AND task_id=%s;",(user_id,task_id))
                 if cur.fetchone():
                     return student["warnings"]
-            cur.execute("INSERT INTO biology_warning_log(user_id,task_id,reason,issued_by) VALUES(%s,%s,%s,%s);",(user_id,task_id,reason,issued_by))
+            cur.execute("INSERT INTO biology_warning_log(user_id,task_id,reason,issued_by) VALUES(%s,%s,%s,%s) RETURNING id;",(user_id,task_id,reason,issued_by))
+            if not cur.fetchone(): return student["warnings"]
             cur.execute("UPDATE biology_students SET warnings=warnings+1 WHERE user_id=%s RETURNING warnings;",(user_id,)); row=cur.fetchone(); conn.commit(); return row["warnings"] if row else 0
     return await run(op)
 
@@ -2480,10 +2507,6 @@ async def add_warning_once(user_id,reason,issued_by=0,task_id=None):
         with connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT warnings,approved,reset_pending FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
             if not student: return {"count":0,"created":False}
-            if task_id:
-                cur.execute("SELECT exam_difficulty FROM biology_tasks WHERE id=%s;",(task_id,))
-                exam=cur.fetchone()
-                if exam and exam.get('exam_difficulty')=='hard': return {"count":student['warnings'],"created":False}
             if task_id and int(issued_by or 0)==0:
                 if not student['approved'] or student.get('reset_pending'): return {"count":student['warnings'],"created":False}
                 # Recheck under the same student lock used by record_submission.
@@ -2491,8 +2514,10 @@ async def add_warning_once(user_id,reason,issued_by=0,task_id=None):
                     JOIN biology_task_students ts ON ts.task_id=t.id AND ts.user_id=%s
                     LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
                     LEFT JOIN biology_task_extensions e ON e.task_id=t.id AND e.user_id=%s
-                    WHERE t.id=%s AND t.optional_practice=FALSE
+                    WHERE t.id=%s AND t.optional_practice=FALSE AND t.retired_obligation=FALSE
+                    AND (t.kind<>'homework' OR t.homework_manual_closed=FALSE)
                     AND (d.id IS NULL OR d.deleted_at IS NULL)
+                    AND biology_section_accountable(ts.user_id,CASE WHEN t.school_review_id IS NOT NULL THEN 'school_review' WHEN t.kind='exam' THEN 'exams' ELSE 'homework' END)
                     AND GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline))<=clock_timestamp()
                     AND NOT EXISTS(SELECT 1 FROM biology_submissions sub WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                     AND NOT EXISTS(SELECT 1 FROM biology_exam_warning_waivers w WHERE w.task_id=t.id AND w.user_id=%s)
@@ -2520,10 +2545,11 @@ async def remove_warning(user_id,removed_by,warning_id=None):
             if selected_warning_id is None: return None
             cur.execute("DELETE FROM biology_warning_log WHERE id=%s AND user_id=%s RETURNING id,task_id;",(selected_warning_id,user_id)); deleted=cur.fetchone()
             if not deleted: return None
-            if deleted.get("task_id"):
+            if deleted.get('task_id'):
                 cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
                     SELECT id,%s,%s FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
-                    (user_id,removed_by,deleted["task_id"]))
+                    (user_id,removed_by,deleted['task_id']))
+                cur.execute("INSERT INTO biology_exam_warning_waivers(task_id,user_id,waived_by) VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO NOTHING;",(deleted['task_id'],user_id,removed_by))
             cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
                 WHERE user_id=%s) WHERE user_id=%s RETURNING warnings;""",(user_id,user_id)); row=cur.fetchone()
             cur.execute("INSERT INTO biology_audit(actor_id,action,details) VALUES(%s,'remove_warning',%s);",(removed_by,f"{user_id}:{selected_warning_id}")); conn.commit(); return row["warnings"] if row else 0
@@ -2762,11 +2788,12 @@ async def v42_repair_chapter_schedules():
     """Repair finish dates previously calculated with one weekday count for all chapters."""
     def students_op():
         with connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT user_id,current_chapter,study_days FROM biology_students WHERE approved=TRUE AND study_track='chapter';"); return cur.fetchall()
+            cur.execute("SELECT user_id,current_chapter,study_days,schedule_mode FROM biology_students WHERE approved=TRUE AND study_track='chapter';"); return cur.fetchall()
     repaired=0
     for student in await run(students_op):
         chapter=int(student.get("current_chapter") or 1); required=5 if chapter==1 else 4 if chapter==2 else 3
         selected=sorted({int(x) for x in (student.get("study_days") or []) if 0<=int(x)<=6})
+        if student.get("schedule_mode")=="custom" and selected: continue
         if len(selected)!=required: selected=sorted({6,0,1,2,3} if chapter==1 else ({6,0,1,3} if chapter==2 else {6,1,3}))
         result=await v41_set_study_days(student["user_id"],selected,True)
         repaired+=1 if result.get("status")=="ok" else 0
@@ -2796,8 +2823,15 @@ async def v28_student_homeworks(user_id):
     def op():
         with connect() as conn, conn.cursor() as cur:
             cur.execute("""SELECT t.* FROM biology_tasks t JOIN biology_task_students ts ON ts.task_id=t.id
-            WHERE t.kind='homework' AND ts.user_id=%s AND t.closed=FALSE ORDER BY t.deadline,t.id DESC;""",(user_id,)); return cur.fetchall()
+            WHERE t.kind='homework' AND ts.user_id=%s AND t.retired_obligation=FALSE
+              AND biology_section_enabled(ts.user_id,'homework')
+              AND t.homework_manual_closed=FALSE
+              AND (t.homework_opens_at IS NULL OR t.homework_opens_at<=CURRENT_TIMESTAMP)
+              AND NOT EXISTS(SELECT 1 FROM biology_submissions sub
+                  WHERE sub.task_id=t.id AND sub.user_id=ts.user_id AND sub.submitted_at IS NOT NULL)
+            ORDER BY t.deadline,t.id DESC;""",(user_id,)); return cur.fetchall()
     return await run(op)
+
 
 async def v28_create_exam_notice(title, body, target_scope, exam_at, created_by):
     def op():
@@ -2877,14 +2911,7 @@ async def v29_create_or_get_exam_task(definition_id,user_id,available_at=None,ap
 
 # ========================= v54 school-review programme =========================
 
-_V54_SCHOOL_REVIEW_SEED=(
-    (1,'الأول','الفصل الأول','المحاضرات 1، 2، 3، 4، 5، 6','2026-09-27','2026-09-27'),
-    (2,'الثاني','الفصل الأول','المحاضرات 7، 8، 9','2026-09-27','2026-10-03'),
-    (3,'الثالث','الفصل الأول','المحاضرات 6، 7، 8، 9، 10، 11، 12','2026-10-03','2026-10-10'),
-    (4,'الرابع','الفصل الأول','المحاضرات 9، 10، 11، 12، 13، 14، 15','2026-10-10','2026-10-17'),
-    (5,'الخامس','الفصل الأول','الفصل الأول كاملاً','2026-10-17','2026-10-24'),
-)
-
+_V54_SCHOOL_REVIEW_SEED=()
 
 _v54_previous_init_db=init_db
 def init_db():
@@ -2894,7 +2921,7 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS biology_school_reviews(
             id SERIAL PRIMARY KEY,
-            week_no INTEGER NOT NULL UNIQUE CHECK(week_no BETWEEN 1 AND 60),
+            week_no INTEGER NOT NULL UNIQUE CHECK(week_no BETWEEN 1 AND 12),
             week_label TEXT NOT NULL,
             chapter_label TEXT NOT NULL,
             topics TEXT NOT NULL,
@@ -2994,7 +3021,7 @@ async def v54_toggle_school_review_student(user_id,enabled_by):
             cur.execute("""SELECT user_id,study_track,approved,reset_pending
                 FROM biology_students WHERE user_id=%s FOR UPDATE;""",(int(user_id),))
             student=cur.fetchone()
-            if not student or not student['approved'] or student.get('reset_pending'):
+            if not student or student['study_track']!='course' or not student['approved'] or student.get('reset_pending'):
                 return {'status':'not_course'}
             cur.execute("SELECT * FROM biology_school_review_students WHERE user_id=%s FOR UPDATE;",(int(user_id),))
             current=cur.fetchone(); enabled=not bool(current and current['active'])
@@ -3040,38 +3067,6 @@ async def v54_school_review_catalog(user_id=None):
                 FROM biology_school_reviews r {join}
                 WHERE r.active=TRUE ORDER BY r.week_no;""",params)
             return cur.fetchall()
-    return await run(op)
-
-
-async def v54_add_school_review(week_no,chapter_label,topics,exam_date,created_by):
-    """Add one future review week from the admin panel.
-
-    Publication is exactly seven days before the exam.  An existing week is
-    never silently overwritten, which protects published schedules.
-    """
-    labels={
-        1:'الأول',2:'الثاني',3:'الثالث',4:'الرابع',5:'الخامس',6:'السادس',
-        7:'السابع',8:'الثامن',9:'التاسع',10:'العاشر',11:'الحادي عشر',
-        12:'الثاني عشر',13:'الثالث عشر',14:'الرابع عشر',15:'الخامس عشر',
-        16:'السادس عشر',17:'السابع عشر',18:'الثامن عشر',19:'التاسع عشر',20:'العشرون',
-    }
-    def op():
-        number=int(week_no)
-        if number<1 or number>60: return {'status':'invalid_week'}
-        exam=exam_date if hasattr(exam_date,'year') else date.fromisoformat(str(exam_date))
-        chapter=str(chapter_label or '').strip(); subject=str(topics or '').strip()
-        if not chapter or not subject: return {'status':'invalid_text'}
-        with connect() as conn,conn.cursor() as cur:
-            cur.execute('SELECT id FROM biology_school_reviews WHERE week_no=%s;',(number,))
-            if cur.fetchone(): return {'status':'exists'}
-            cur.execute("""INSERT INTO biology_school_reviews
-                (week_no,week_label,chapter_label,topics,publish_date,exam_date)
-                VALUES(%s,%s,%s,%s,%s,%s) RETURNING *;""",
-                (number,labels.get(number,f'رقم {number}'),chapter,subject,exam-timedelta(days=7),exam))
-            row=cur.fetchone()
-            cur.execute("INSERT INTO biology_audit(actor_id,action,details) VALUES(%s,'school_review_added',%s);",
-                (int(created_by),f'week={number}; exam={exam.isoformat()}'))
-            conn.commit(); return {'status':'ok','review':row}
     return await run(op)
 
 
@@ -3143,6 +3138,9 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
     review=cur.fetchone()
     if not review or review.get('exam_deleted'): return None
     available=review.get('exam_opens_at') or datetime.combine(review['exam_date'],time(18),tzinfo=ZoneInfo('Asia/Baghdad'))
+    # For scheduled PDF exams, request parental approval only when the exam opens.
+    if review.get('source_type')=='pdf' and available>datetime_now(cur):
+        return None
     cur.execute("SELECT * FROM biology_school_review_exam_media WHERE review_id=%s ORDER BY position,id;",(int(review_id),))
     media=cur.fetchall()
     if not media: return None
@@ -3150,6 +3148,10 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
     cur.execute("SELECT * FROM biology_tasks WHERE school_review_id=%s AND target_scope=%s ORDER BY id DESC LIMIT 1;",
         (int(review_id),scope))
     task=cur.fetchone()
+    # An expired PDF publication cannot create a brand-new student attempt.
+    # Previously created tasks remain available for explicit individual extensions.
+    if not task and review.get('source_type')=='pdf' and review.get('exam_closes_at') and review['exam_closes_at']<=datetime_now(cur):
+        return None
     if not task:
         first=next((item for item in media if item['payload_type']!='text'),media[0])
         combined_text='\n\n'.join(item['text_content'] for item in media
@@ -3157,16 +3159,17 @@ def _v54_ensure_school_review_task(cur,review_id,user_id):
         synthetic=-(880000000000000000+int(review_id)*100000000000+int(user_id)%100000000000)
         title=f"مراجعة المدرسة — الأسبوع {review['week_label']}"
         deadline=review.get('exam_closes_at') or available+timedelta(hours=24)
+        duration_hours=max(1,int((deadline-available).total_seconds()/3600+0.999))
         cur.execute("""INSERT INTO biology_tasks
             (kind,title,chat_id,thread_id,source_message_id,payload_type,file_id,text_content,deadline,
              xp_reward,created_by,target_scope,linked_lectures,exam_pending_activation,
              exam_duration_hours,exam_approval_required,closed,optional_practice,school_review_id)
-            VALUES('exam',%s,%s,0,%s,%s,%s,%s,%s,20,%s,%s,'',TRUE,24,TRUE,FALSE,TRUE,%s)
+            VALUES('exam',%s,%s,0,%s,%s,%s,%s,%s,20,%s,%s,'',TRUE,%s,TRUE,FALSE,TRUE,%s)
             ON CONFLICT (school_review_id,target_scope)
               WHERE school_review_id IS NOT NULL AND target_scope LIKE 'student:%%'
             DO NOTHING RETURNING *;""",
             (title,OWNER_CHAT_ID or 0,synthetic,first['payload_type'],first.get('file_id'),combined_text or title,
-             deadline,OWNER_CHAT_ID or 0,scope,int(review_id)))
+             deadline,OWNER_CHAT_ID or 0,scope,duration_hours,int(review_id)))
         task=cur.fetchone()
         if not task:
             cur.execute("SELECT * FROM biology_tasks WHERE school_review_id=%s AND target_scope=%s ORDER BY id DESC LIMIT 1;",
@@ -3287,7 +3290,7 @@ async def v54_due_school_review_reminders(limit=100):
                 JOIN biology_students s ON s.user_id=e.user_id AND s.approved=TRUE
                     AND s.reset_pending=FALSE
                 LEFT JOIN biology_school_review_progress p ON p.review_id=r.id AND p.user_id=s.user_id
-                WHERE r.active=TRUE AND r.published_at IS NOT NULL AND p.completed_at IS NULL
+                WHERE r.active=TRUE AND r.source_type='weekly' AND r.published_at IS NOT NULL AND p.completed_at IS NULL
                   AND r.exam_date>=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
                   AND r.exam_date-(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE<=4)
                 SELECT due.* FROM due
@@ -3687,7 +3690,7 @@ async def v37_track_change_status(user_id):
     return await run(op)
 
 async def v37_request_track_change(user_id, study_track, chapter, start_date, plan_rows):
-    if study_track not in ("course","chapter") or (study_track=="chapter" and chapter not in range(1,6)):
+    if study_track not in ("course","chapter") or (study_track=="chapter" and chapter not in range(1,CHAPTER_COUNT+1)):
         return {"status":"invalid"}
     def op():
         with connect() as conn, conn.cursor() as cur:
@@ -3763,9 +3766,9 @@ async def v37_admin_decide_track_change(request_id, approve, admin_id):
                     AND ((%s='course' AND t.target_scope LIKE 'student:%%') OR (%s='chapter' AND t.target_scope='course'));""",
                     (req["user_id"],req["user_id"],req["requested_track"],req["requested_track"]))
                 if req["requested_track"]=="chapter":
-                    # Build the complete plan from the requested chapter through chapter 9.
+                    # Build the complete plan from the requested chapter through chapter 7.
                     cursor=req["requested_start_date"]
-                    for ch in range(int(req["requested_chapter"]),10):
+                    for ch in range(int(req["requested_chapter"]),CHAPTER_COUNT+1):
                         groups=CHAPTER_PREPARATION_DISTRIBUTION.get(ch,[])
                         allowed={6,0,1,2,3} if ch==1 else ({6,0,1,3} if ch==2 else {6,1,3})
                         for prep_no,nums in enumerate(groups,1):
@@ -4012,10 +4015,15 @@ async def v43_extend_exam_student(task_id,user_id,hours,admin_id):
             cur.execute("""INSERT INTO biology_task_extensions(task_id,user_id,requested_at,extended_until)
                 VALUES(%s,%s,CURRENT_TIMESTAMP,%s) ON CONFLICT(task_id,user_id) DO UPDATE SET
                 requested_at=CURRENT_TIMESTAMP,extended_until=EXCLUDED.extended_until;""",(int(task_id),int(user_id),until))
+            cur.execute("""INSERT INTO biology_exam_access(task_id,user_id,status,approved_by)
+                    VALUES(%s,%s,'approved',%s) ON CONFLICT(task_id,user_id)
+                    DO UPDATE SET status='approved',approved_by=EXCLUDED.approved_by;""",(int(task_id),int(user_id),int(admin_id)))
             cur.execute("DELETE FROM biology_exam_warning_waivers WHERE task_id=%s AND user_id=%s;",(int(task_id),int(user_id)))
             cur.execute("DELETE FROM biology_warning_log WHERE task_id=%s AND user_id=%s RETURNING id;",(int(task_id),int(user_id))); removed=len(cur.fetchall())
             if removed: cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-%s) WHERE user_id=%s;",(removed,int(user_id)))
             cur.execute("""UPDATE biology_tasks SET closed=FALSE,warned=FALSE,
+                    exam_approval_required=(exam_approval_required OR exam_pending_activation),
+                    exam_pending_activation=FALSE,exam_available_at=LEAST(exam_available_at,CURRENT_TIMESTAMP),
                 teacher_deadline_reminder_sent=FALSE,champion_announced=FALSE WHERE id=%s;""",(int(task_id),))
             cur.execute("INSERT INTO biology_audit(actor_id,action,details) VALUES(%s,'reopen_exam_student',%s);",
                         (int(admin_id),f"task_id={task_id};user_id={user_id};hours={h};warnings_removed={removed}"))
@@ -4044,10 +4052,15 @@ async def v43_extend_exam_definition(definition_id,hours,admin_id):
                 cur.execute("""INSERT INTO biology_task_extensions(task_id,user_id,requested_at,extended_until)
                     VALUES(%s,%s,CURRENT_TIMESTAMP,%s) ON CONFLICT(task_id,user_id) DO UPDATE SET
                     requested_at=CURRENT_TIMESTAMP,extended_until=EXCLUDED.extended_until;""",(item["task_id"],item["user_id"],until))
+                cur.execute("""INSERT INTO biology_exam_access(task_id,user_id,status,approved_by)
+                    VALUES(%s,%s,'approved',%s) ON CONFLICT(task_id,user_id)
+                    DO UPDATE SET status='approved',approved_by=EXCLUDED.approved_by;""",(item["task_id"],item["user_id"],int(admin_id)))
                 cur.execute("DELETE FROM biology_exam_warning_waivers WHERE task_id=%s AND user_id=%s;",(item["task_id"],item["user_id"]))
                 cur.execute("DELETE FROM biology_warning_log WHERE task_id=%s AND user_id=%s RETURNING id;",(item["task_id"],item["user_id"])); removed=len(cur.fetchall())
                 if removed: cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-%s) WHERE user_id=%s;",(removed,item["user_id"]))
                 cur.execute("""UPDATE biology_tasks SET closed=FALSE,warned=FALSE,
+                    exam_approval_required=(exam_approval_required OR exam_pending_activation),
+                    exam_pending_activation=FALSE,exam_available_at=LEAST(exam_available_at,CURRENT_TIMESTAMP),
                     teacher_deadline_reminder_sent=FALSE,champion_announced=FALSE WHERE id=%s;""",(item["task_id"],))
                 cur.execute("SELECT warnings FROM biology_students WHERE user_id=%s;",(item["user_id"],)); remaining=int(cur.fetchone()["warnings"])
                 results.append({**dict(item),"extended_until":until,"warnings_removed":removed,"warnings":remaining})
@@ -4069,8 +4082,8 @@ async def v43_clear_exam_definition_warnings(definition_id,admin_id):
                 WHERE t.exam_definition_id=%s AND t.kind='exam';""",(int(definition_id),)); students=cur.fetchall(); removed_total=0
             for item in students:
                 cur.execute("""INSERT INTO biology_v9_deleted_task_warnings(task_id,user_id,deleted_by)
-                    VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO NOTHING;""",
-                    (item["task_id"],item["user_id"],int(admin_id)))
+                    SELECT id,%s,%s FROM biology_tasks WHERE id=%s ON CONFLICT(task_id,user_id) DO NOTHING;""",
+                    (item["user_id"],int(admin_id),item["task_id"]))
                 cur.execute("DELETE FROM biology_warning_log WHERE task_id=%s AND user_id=%s RETURNING id;",(item["task_id"],item["user_id"])); removed=len(cur.fetchall()); removed_total+=removed
                 if removed: cur.execute("UPDATE biology_students SET warnings=GREATEST(0,warnings-%s) WHERE user_id=%s;",(removed,item["user_id"]))
                 item["warnings_removed"]=removed
@@ -4118,7 +4131,7 @@ async def v43_remove_warning(user_id,warning_id,admin_id):
             cur.execute("DELETE FROM biology_warning_log WHERE id=%s;",(int(warning_id),))
             cur.execute("""UPDATE biology_students SET warnings=(SELECT COUNT(*) FROM biology_warning_log
                 WHERE user_id=%s) WHERE user_id=%s RETURNING warnings,full_name;""",(int(user_id),int(user_id))); student=cur.fetchone()
-            if warning.get("task_id") and warning.get("kind") in ("exam","homework"):
+            if warning.get("task_id"):
                 cur.execute("""INSERT INTO biology_exam_warning_waivers(task_id,user_id,waived_by)
                     VALUES(%s,%s,%s) ON CONFLICT(task_id,user_id) DO UPDATE SET
                     waived_by=EXCLUDED.waived_by,created_at=CURRENT_TIMESTAMP;""",(warning["task_id"],int(user_id),int(admin_id)))
@@ -4257,7 +4270,7 @@ async def v37_reset_schedule_to_regular(user_id):
                 from data import CHAPTER_PREPARATION_DISTRIBUTION
                 start=date_today=__import__("datetime").date.today()
                 cursor=start-timedelta(days=1)
-                for ch in range(int(student.get("current_chapter") or 1),10):
+                for ch in range(int(student.get("current_chapter") or 1),CHAPTER_COUNT+1):
                     groups=CHAPTER_PREPARATION_DISTRIBUTION.get(ch,[])
                     allowed={6,0,1,2,3} if ch==1 else ({6,0,1,3} if ch==2 else {6,1,3})
                     for prep_no,nums in enumerate(groups,1):
@@ -4524,10 +4537,10 @@ async def v39_mistake_notebook(user_id,limit=10):
 # ========================= v41 STUDY RESET / ROYAL REVIEW / WEAKNESSES =========================
 
 def _v41_plan_rows(start_chapter,start_date,study_days=None):
-    """Build a complete chapter plan from the selected chapter to chapter 9."""
+    """Build a complete chapter plan from the selected chapter to chapter 7."""
     from data import CHAPTER_PREPARATION_DISTRIBUTION
     rows=[]; cursor=start_date
-    for chapter in range(int(start_chapter),10):
+    for chapter in range(int(start_chapter),CHAPTER_COUNT+1):
         groups=CHAPTER_PREPARATION_DISTRIBUTION.get(chapter,[])
         allowed=set(study_days or ({6,0,1,2,3} if chapter==1 else ({6,0,1,3} if chapter==2 else {6,1,3})))
         for prep_no,nums in enumerate(groups,1):
@@ -4600,7 +4613,7 @@ async def set_student_onboarding(user_id,study_track,current_chapter,start_date,
 
 
 async def v37_request_track_change(user_id,study_track,chapter,start_date,plan_rows):
-    if study_track not in ("course","chapter") or (study_track=="chapter" and chapter not in range(1,6)):
+    if study_track not in ("course","chapter") or (study_track=="chapter" and chapter not in range(1,CHAPTER_COUNT+1)):
         return {"status":"invalid"}
     def op():
         with connect() as conn, conn.cursor() as cur:
@@ -4674,17 +4687,18 @@ async def v37_admin_decide_track_change(request_id,approve,admin_id):
     return await run(op)
 
 
-async def v41_set_study_days(user_id,days):
-    """Chapter students may replace weekdays only; the required count is fixed by the chapter."""
+async def v60_set_study_days(user_id,days,_repair=False):
+    """Chapter students choose 1–7 weekdays; reschedule only unfinished preparations."""
     days=sorted({int(day) for day in days})
     def op():
         with connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
             if not student: return {"status":"missing"}
             if student.get("study_track")!="chapter": return {"status":"course"}
+            if not student.get("approved") or student.get("reset_pending"): return {"status":"inactive"}
             chapter=int(student.get("current_chapter") or 1)
-            required=5 if chapter==1 else 4 if chapter==2 else 3
-            if len(days)!=required or any(day<0 or day>6 for day in days):
+            required=len(days)
+            if not 1<=len(days)<=7 or any(day<0 or day>6 for day in days):
                 return {"status":"count","required":required}
             cur.execute("""SELECT * FROM biology_personal_preparations
                 WHERE user_id=%s ORDER BY chapter,prep_no,target_date,id FOR UPDATE;""",(user_id,)); rows=cur.fetchall()
@@ -4702,7 +4716,7 @@ async def v41_set_study_days(user_id,days):
                 cur.execute("""UPDATE biology_personal_preparations
                     SET target_date=target_date+10000 WHERE id=ANY(%s);""",(pending_ids,))
                 from datetime import date
-                cursor=date.today()-timedelta(days=1)
+                cursor=datetime.now(ZoneInfo("Asia/Baghdad")).date()-timedelta(days=1)
                 for row in pending:
                     while True:
                         cursor += timedelta(days=1)
@@ -4961,7 +4975,7 @@ async def student_exam_lock(user_id):
                       WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter') OR
+                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -4985,7 +4999,7 @@ async def v28_student_exam_tasks(user_id):
                   AND (d.id IS NULL OR d.deleted_at IS NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter') OR
+                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5229,19 +5243,35 @@ async def v48_stage_submission_delivery(task_id,user_id,student_message_id,paylo
     def op():
         with connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;",(int(user_id),)); student=cur.fetchone()
-            if not student or not student.get('approved') or student.get('reset_pending'): return {'status':'not_allowed'}
+            if not student or not student.get('approved') or student.get('reset_pending') or student.get('admin_blocked'): return {'status':'not_allowed'}
             cur.execute("""SELECT t.*,GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS effective_deadline,
                     e.extended_until,CURRENT_TIMESTAMP AS now
                 FROM biology_tasks t JOIN biology_task_students ts ON ts.task_id=t.id AND ts.user_id=%s
                 LEFT JOIN biology_task_extensions e ON e.task_id=t.id AND e.user_id=%s
                 LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
-                WHERE t.id=%s AND (d.id IS NULL OR d.deleted_at IS NULL) FOR UPDATE OF t;""",
+                WHERE t.id=%s AND t.retired_obligation=FALSE AND (d.id IS NULL OR d.deleted_at IS NULL) FOR UPDATE OF t;""",
                 (int(user_id),int(user_id),int(task_id))); task=cur.fetchone()
-            if not task or task.get('exam_pending_activation') or task['effective_deadline']<=task['now']:
+            if task:
+                cur.execute("""SELECT * FROM biology_submission_delivery_outbox
+                    WHERE task_id=%s AND user_id=%s AND file_unique_id=%s
+                    AND status IN ('pending','delivered') FOR UPDATE;""",
+                    (int(task_id),int(user_id),str(file_unique_id)))
+                accepted=cur.fetchone()
+                if accepted:
+                    if destination_thread_id and accepted['status']=='pending':
+                        cur.execute("""UPDATE biology_submission_delivery_outbox SET destination_thread_id=%s
+                            WHERE id=%s RETURNING *;""",(int(destination_thread_id),accepted['id']))
+                        accepted=cur.fetchone()
+                    conn.commit()
+                    return {'status':'delivered' if accepted['status']=='delivered' else 'ok','delivery':accepted,'task':task}
+            from student_sections_schema import task_allowed
+            if task and not task_allowed(cur,user_id,task,'biology'): return {'status':'not_allowed'}
+            if not task or (task['kind']!='homework' and task['effective_deadline']<=task['now']):
                 return {'status':'expired' if task else 'not_allowed'}
-            if task.get('closed') and not (task.get('extended_until') and task['extended_until']>task['now']): return {'status':'not_allowed'}
+            if task['kind']=='homework' and (task.get('homework_manual_closed') or (task.get('homework_opens_at') and task['homework_opens_at']>task['now'])): return {'status':'not_allowed'}
+            if task['kind']!='homework' and task.get('closed') and not (task.get('extended_until') and task['extended_until']>task['now']): return {'status':'not_allowed'}
             if task.get('exam_available_at') and task['exam_available_at']>task['now']: return {'status':'not_allowed'}
-            if task.get('exam_approval_required'):
+            if task.get('exam_approval_required') or task.get('exam_pending_activation'):
                 cur.execute("SELECT 1 FROM biology_exam_access WHERE task_id=%s AND user_id=%s AND status='approved';",(int(task_id),int(user_id)))
                 if not cur.fetchone(): return {'status':'not_allowed'}
             cur.execute("SELECT * FROM biology_submissions WHERE task_id=%s AND user_id=%s FOR UPDATE;", (int(task_id),int(user_id)))
@@ -5253,6 +5283,14 @@ async def v48_stage_submission_delivery(task_id,user_id,student_message_id,paylo
             cur.execute("SELECT user_id FROM biology_submission_files WHERE task_id=%s AND file_unique_id=%s;",(int(task_id),str(file_unique_id)))
             used=cur.fetchone()
             if used and int(used['user_id'])!=int(user_id): return {'status':'duplicate'}
+            # The student row above serializes staging, including concurrent albums.
+            # Existing accepted files return earlier, so retries do not consume slots.
+            from submission_uploads import MAX_SUBMISSION_FILES
+            cur.execute("""SELECT COUNT(*) AS n FROM biology_submission_delivery_outbox
+                WHERE task_id=%s AND user_id=%s AND media_group_id IS NOT DISTINCT FROM %s
+                  AND status IN ('pending','delivered');""",(int(task_id),int(user_id),media_group_id))
+            if cur.fetchone()['n'] >= MAX_SUBMISSION_FILES:
+                return {'status':'photo_limit','limit':MAX_SUBMISSION_FILES}
             cur.execute("""INSERT INTO biology_submission_delivery_outbox
                     (task_id,user_id,student_message_id,payload_type,file_id,file_unique_id,media_group_id,
                      destination_chat_id,destination_thread_id,status,next_attempt_at)
@@ -5475,7 +5513,7 @@ async def v42_mark_missing_exam_reminded(prep_no):
 _v42_previous_create_linked_exam_definition=create_linked_exam_definition
 async def create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope="chapter",selected_lectures=None,exam_type="normal",duration_hours=2,difficulty="easy"):
     """Create an exam and snapshot the exact lectures selected by the teacher."""
-    row=await _v42_previous_create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope,selected_lectures,exam_type,duration_hours,difficulty)
+    row=await _v42_previous_create_linked_exam_definition(selected_pairs,title,created_by,media,target_scope,selected_lectures,exam_type,duration_hours,difficulty=difficulty)
     pairs=sorted({(int(ch),int(prep)) for ch,prep in (selected_pairs or [])})
     if row and pairs:
         def op():
@@ -5519,7 +5557,13 @@ def init_db():
 # ========================= v44 STUDY FLOW RELIABILITY =========================
 
 async def v44_free_exam_extension(task_id,user_id,hours=24):
-    """Extend an open exam; expired exams require the paid approval path."""
+    """Use the weekly extension even when the exam already expired.
+
+    The student row is locked first, so two fast button presses cannot consume
+    the same weekly allowance twice. Reopening also clears only the warning
+    generated by this exact exam and gives the student a genuinely fresh
+    deadline.
+    """
     def op():
         h=max(1,min(24,int(hours)))
         with connect() as conn, conn.cursor() as cur:
@@ -5541,10 +5585,6 @@ async def v44_free_exam_extension(task_id,user_id,hours=24):
                 FOR UPDATE OF t;""",(int(user_id),int(task_id)))
             task=cur.fetchone()
             if not task: return {"status":"not_found"}
-            cur.execute("SELECT extended_until FROM biology_task_extensions WHERE task_id=%s AND user_id=%s;",(int(task_id),int(user_id)))
-            existing_extension=cur.fetchone()
-            effective=max(task['deadline'],existing_extension['extended_until']) if existing_extension else task['deadline']
-            if task.get('closed') or effective<=task['now']: return {'status':'paid_required'}
             cur.execute("SELECT 1 FROM biology_submissions WHERE task_id=%s AND user_id=%s AND submitted_at IS NOT NULL;",(int(task_id),int(user_id)))
             if cur.fetchone(): return {"status":"submitted"}
             cur.execute("SELECT (CURRENT_DATE-(EXTRACT(ISODOW FROM CURRENT_DATE)::INTEGER-1))::DATE AS week_start;")
@@ -5595,7 +5635,7 @@ async def student_exam_lock(user_id):
                       WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter') OR
+                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5745,7 +5785,7 @@ async def student_exam_lock(user_id):
                       WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter') OR
+                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5774,7 +5814,7 @@ async def v28_student_exam_tasks(user_id):
                     WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
                   AND (
                     (d.target_scope='course' AND st.study_track='course') OR
-                    (d.target_scope='chapter' AND st.study_track='chapter') OR
+                    (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
                     (d.id IS NULL AND (t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))
@@ -5793,8 +5833,8 @@ async def v45_exam_task_status(user_id,task_id):
                       COALESCE((SELECT value::date FROM biology_settings WHERE key='v45_exam_enforcement_cutoff'),DATE '2026-09-27')
                       AT TIME ZONE 'Asia/Baghdad') OR t.school_review_id IS NOT NULL OR COALESCE(e.extended_until>CURRENT_TIMESTAMP,FALSE)) AS enforced,
                     ((d.target_scope='course' AND st.study_track='course') OR
-                     (d.target_scope='chapter' AND st.study_track='chapter') OR
-                     (d.id IS NULL AND ((t.school_review_id IS NOT NULL AND t.target_scope='student:'||st.user_id::text AND st.approved=TRUE AND st.reset_pending=FALSE AND st.study_track='course' AND EXISTS(SELECT 1 FROM biology_school_review_students se JOIN biology_school_reviews sr ON sr.id=t.school_review_id WHERE se.user_id=st.user_id AND se.active=TRUE AND sr.active=TRUE AND sr.exam_deleted=FALSE)) OR t.target_scope='all' OR
+                     (d.target_scope='chapter' AND st.study_track='chapter' AND d.chapter=st.current_chapter) OR
+                     (d.id IS NULL AND ((t.school_review_id IS NOT NULL AND t.target_scope='student:'||st.user_id::text AND st.approved=TRUE AND st.reset_pending=FALSE AND EXISTS(SELECT 1 FROM biology_school_review_students se JOIN biology_school_reviews sr ON sr.id=t.school_review_id WHERE se.user_id=st.user_id AND se.active=TRUE AND sr.active=TRUE AND sr.exam_deleted=FALSE)) OR t.target_scope='all' OR
                        (st.study_track='course' AND t.target_scope='course') OR
                        (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter)))) AS track_allowed,
                     GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline)) AS effective_deadline,
@@ -5829,8 +5869,8 @@ async def v45_request_late_exam(task_id,user_id,xp_cost=150,hours=2):
                 LEFT JOIN biology_task_extensions e ON e.task_id=t.id AND e.user_id=ts.user_id
                 WHERE t.id=%s AND t.kind='exam' AND (d.id IS NULL OR d.deleted_at IS NULL)
                   AND ((d.target_scope='course' AND s.study_track='course') OR
-                    (d.target_scope='chapter' AND s.study_track='chapter') OR
-                    (d.id IS NULL AND ((t.school_review_id IS NOT NULL AND t.target_scope='student:'||s.user_id::text AND s.approved=TRUE AND s.reset_pending=FALSE AND s.study_track='course' AND EXISTS(SELECT 1 FROM biology_school_review_students se JOIN biology_school_reviews sr ON sr.id=t.school_review_id WHERE se.user_id=s.user_id AND se.active=TRUE AND sr.active=TRUE AND sr.exam_deleted=FALSE)) OR t.target_scope='all' OR
+                    (d.target_scope='chapter' AND s.study_track='chapter' AND d.chapter=s.current_chapter) OR
+                    (d.id IS NULL AND ((t.school_review_id IS NOT NULL AND t.target_scope='student:'||s.user_id::text AND s.approved=TRUE AND s.reset_pending=FALSE AND EXISTS(SELECT 1 FROM biology_school_review_students se JOIN biology_school_reviews sr ON sr.id=t.school_review_id WHERE se.user_id=s.user_id AND se.active=TRUE AND sr.active=TRUE AND sr.exam_deleted=FALSE)) OR t.target_scope='all' OR
                       (s.study_track='course' AND t.target_scope='course') OR
                       (s.study_track='chapter' AND t.target_scope='chapter_'||s.current_chapter))))
                 FOR UPDATE OF t,s;""",(int(user_id),int(task_id)))
@@ -6004,7 +6044,7 @@ async def v42_review_context(user_id):
             if student.get("study_track")=="course":
                 cur.execute("""SELECT prep_no,chapter,chapter_prep_no,lectures,target_date,published,published_at
                     FROM biology_preparations
-                    WHERE chapter>3 OR (chapter=3 AND chapter_prep_no>=11)
+                    WHERE chapter>3 OR (chapter=3 AND chapter_prep_no>=9)
                     ORDER BY chapter,chapter_prep_no,prep_no;""")
             else:
                 cur.execute("""SELECT prep_no,chapter,chapter_prep_no,lectures,target_date,published,published_at
@@ -6139,7 +6179,7 @@ def v47_plan_rows(chapter,prep_no,start_date):
     if not 1<=prep_no<=len(groups): raise ValueError('Invalid starting preparation')
     # Build only the selected and subsequent preparations, without consuming dates for skipped work.
     rows=[]; cursor=start_date
-    for ch in range(chapter,10):
+    for ch in range(chapter,CHAPTER_COUNT+1):
         allowed={6,0,1,2,3} if ch==1 else ({6,0,1,3} if ch==2 else {6,1,3})
         for number,nums in enumerate(CHAPTER_PREPARATION_DISTRIBUTION.get(ch,[]),1):
             if ch==chapter and number<prep_no: continue
@@ -6336,15 +6376,13 @@ async def _v47_create_task_atomic(definition_id,user_id,publish_at,deadline,opti
                 if student.get('study_track')!='chapter' or int(student['current_chapter'])!=int(d['chapter']): return None
                 active={pair for pair in required if not v47_before_start(student,*pair)}
                 if not active: return None
-                for ch,lecture in active:
+                for ch,lecture in (active if _section_lectures_required(cur,user_id) else ()):
                     cur.execute('SELECT 1 FROM biology_lecture_progress WHERE user_id=%s AND chapter=%s AND lecture=%s AND completed_at IS NOT NULL;', (user_id,ch,lecture))
                     if not cur.fetchone(): return None
             cur.execute('SELECT payload_type,file_id FROM biology_linked_exam_media WHERE definition_id=%s ORDER BY position,id;', (definition_id,)); media=cur.fetchall()
             if not media: return None
             difficulty=d.get('difficulty','easy')
-            publish_at_local=now
-            deadline_local=now+timedelta(hours=24)
-            duration_hours=24
+            duration_hours=max(1,int(((deadline_local-publish_at_local).total_seconds()+3599)//3600))
             synthetic=-(700000000000000000+(definition_id*1000000000000+user_id)%100000000000000000)
             cur.execute("""INSERT INTO biology_tasks(kind,title,chat_id,thread_id,source_message_id,payload_type,file_id,
                 text_content,deadline,xp_reward,created_by,target_scope,linked_lectures,exam_pending_activation,
@@ -6352,7 +6390,7 @@ async def _v47_create_task_atomic(definition_id,user_id,publish_at,deadline,opti
                 VALUES('exam',%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,%s,%s,FALSE,FALSE,%s,%s,%s)
                 ON CONFLICT (exam_definition_id,target_scope) WHERE exam_definition_id IS NOT NULL AND target_scope LIKE 'student:%%'
                 DO NOTHING RETURNING *;""",(d['title'],OWNER_CHAT_ID or d['created_by'],synthetic,media[0]['payload_type'],media[0]['file_id'],
-                d['title'],deadline_local,60 if difficulty=='hard' else 20,d['created_by'],target,','.join(f'ف{ch}/م{lec}' for ch,lec in sorted(required)),definition_id,duration_hours,publish_at_local,publish_at_local,difficulty=='hard',difficulty))
+                d['title'],deadline_local,60 if difficulty=='hard' else 20,d['created_by'],target,','.join(f'ف{ch}/م{lec}' for ch,lec in sorted(required)),definition_id,duration_hours,publish_at_local,publish_at_local,bool(optional) or difficulty=='hard',difficulty))
             task=cur.fetchone()
             if not task: return None
             cur.execute('INSERT INTO biology_task_students(task_id,user_id) VALUES(%s,%s) ON CONFLICT DO NOTHING;', (task['id'],user_id))
@@ -6360,6 +6398,7 @@ async def _v47_create_task_atomic(definition_id,user_id,publish_at,deadline,opti
                 cur.execute('INSERT INTO biology_task_media(task_id,payload_type,file_id,source_message_id) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING;', (task['id'],item['payload_type'],item['file_id'],synthetic-pos))
             conn.commit(); return task
     return await run(op)
+
 
 
 async def v29_ready_personal_exams():
@@ -6374,12 +6413,13 @@ async def v29_ready_personal_exams():
             for student in cur.fetchall():
                 required={p for p in _v47_required_lectures(cur,student['definition_id']) if not v47_before_start(student,*p)}
                 if not required: continue
-                for ch,lecture in required:
+                for ch,lecture in (required if _section_lectures_required(cur,student['user_id']) else ()):
                     cur.execute('SELECT 1 FROM biology_lecture_progress WHERE user_id=%s AND chapter=%s AND lecture=%s AND completed_at IS NOT NULL;', (student['user_id'],ch,lecture))
                     if not cur.fetchone(): break
                 else: ready.append({'definition_id':student['definition_id'],'user_id':student['user_id']})
             return ready
     return await run(op)
+
 
 
 async def v31_active_exam_definitions():
@@ -6444,8 +6484,7 @@ async def v47_activate_legacy_ready_exams():
                 JOIN biology_task_students ts ON ts.task_id=t.id
                 JOIN biology_students s ON s.user_id=ts.user_id
                 JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
-                WHERE t.exam_pending_activation=TRUE AND t.exam_available_at IS NULL AND t.published_at IS NULL
-                AND d.target_scope='chapter' AND d.deleted_at IS NULL
+                WHERE t.exam_pending_activation=TRUE AND d.target_scope='chapter' AND d.deleted_at IS NULL
                 AND s.approved=TRUE AND s.reset_pending=FALSE AND s.study_track='chapter' AND s.current_chapter=d.chapter
                 FOR UPDATE OF t,s;""")
             candidates=cur.fetchall();activated=[]
@@ -6454,7 +6493,7 @@ async def v47_activate_legacy_ready_exams():
                 required=_v47_required_lectures(cur,definition_id)
                 active={p for p in required if not v47_before_start(student,*p)}
                 if not active: continue
-                for ch,lecture in active:
+                for ch,lecture in (active if _section_lectures_required(cur,student['user_id']) else ()):
                     cur.execute('SELECT 1 FROM biology_lecture_progress WHERE user_id=%s AND chapter=%s AND lecture=%s AND completed_at IS NOT NULL;', (student['user_id'],ch,lecture))
                     if not cur.fetchone(): break
                 else:
@@ -6466,11 +6505,12 @@ async def v47_activate_legacy_ready_exams():
     return await run(op)
 
 
+
 # v47.1 review fixes: helpers shared by the active transaction paths above.
 def _v48_restore_course_state(cur,user_id):
     cur.execute("""UPDATE biology_students SET schedule_mode='regular',start_chapter=NULL,start_prep_no=1,
         study_days=ARRAY[1,3,5,6],xp=COALESCE(course_xp,xp) WHERE user_id=%s;""",(user_id,))
-    cur.execute("""UPDATE biology_tasks t SET optional_practice=COALESCE(t.exam_difficulty='hard',FALSE)
+    cur.execute("""UPDATE biology_tasks t SET optional_practice=FALSE
         FROM biology_linked_exam_definitions d WHERE t.exam_definition_id=d.id
         AND d.target_scope='course' AND d.deleted_at IS NULL AND t.target_scope=%s
         AND (t.deadline>CURRENT_TIMESTAMP OR EXISTS(SELECT 1 FROM biology_task_extensions e
@@ -6644,7 +6684,8 @@ def _v48_task_track_allowed(task):
     if definition_scope=='course':
         return track=='course'
     if definition_scope=='chapter':
-        return track=='chapter'
+        return (track=='chapter' and
+                int(task.get('definition_chapter') or 0)==int(task.get('current_chapter') or 0))
     scope=str(task.get('target_scope') or '')
     if scope=='all':
         return True
@@ -6692,8 +6733,33 @@ async def v48_retire_stale_exam_obligations(cutoff_date):
 
 
 async def student_exam_lock(user_id):
-    """Exam debt never blocks preparation or subsequent exams."""
-    return None
+    def op():
+        with connect() as conn,conn.cursor() as cur:
+            cur.execute("""SELECT t.*,d.target_scope AS definition_scope,d.chapter AS definition_chapter,
+                    d.obligation_retired_at,st.study_track,st.current_chapter,st.start_chapter,st.start_prep_no
+                FROM biology_tasks t JOIN biology_task_students ts ON ts.task_id=t.id
+                JOIN biology_students st ON st.user_id=ts.user_id
+                LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
+                WHERE t.kind='exam' AND t.optional_practice=FALSE AND ts.user_id=%s
+                  AND (d.id IS NULL OR d.deleted_at IS NULL)
+                  AND (t.retired_obligation=FALSE OR EXISTS(SELECT 1 FROM biology_task_extensions e
+                    WHERE e.task_id=t.id AND e.user_id=ts.user_id AND e.extended_until>CURRENT_TIMESTAMP))
+                  AND (COALESCE(t.published_at,t.exam_available_at,d.created_at,t.created_at)>=(
+                    COALESCE((SELECT value::date FROM biology_settings WHERE key='v45_exam_enforcement_cutoff'),DATE '2026-09-27')
+                    AT TIME ZONE 'Asia/Baghdad') OR EXISTS(SELECT 1 FROM biology_task_extensions e
+                      WHERE e.task_id=t.id AND e.user_id=ts.user_id AND e.extended_until>CURRENT_TIMESTAMP))
+                  AND biology_section_accountable(ts.user_id,CASE WHEN t.school_review_id IS NOT NULL THEN 'school_review' WHEN t.kind='exam' THEN 'exams' ELSE 'homework' END)
+                  AND NOT EXISTS(SELECT 1 FROM biology_submissions sub WHERE sub.task_id=t.id
+                    AND sub.user_id=ts.user_id AND sub.submitted_at IS NOT NULL)
+                ORDER BY CASE WHEN t.exam_pending_activation THEN 0 WHEN t.closed THEN 1 ELSE 2 END,
+                    COALESCE(t.published_at,t.exam_available_at,t.created_at),t.id;""",(int(user_id),))
+            for task in cur.fetchall():
+                if not _v48_task_track_allowed(task): continue
+                if _v48_definition_before_start(cur,task,task.get('exam_definition_id')): continue
+                return task
+            return None
+    return await run(op)
+
 
 
 async def v28_student_exam_tasks(user_id):
@@ -6753,6 +6819,7 @@ async def missing_students(task_id):
                 LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
                 WHERE ts.task_id=%s AND s.approved=TRUE AND t.optional_practice=FALSE
                   AND t.retired_obligation=FALSE AND (d.id IS NULL OR d.deleted_at IS NULL)
+                  AND biology_section_accountable(ts.user_id,CASE WHEN t.school_review_id IS NOT NULL THEN 'school_review' WHEN t.kind='exam' THEN 'exams' ELSE 'homework' END)
                   AND NOT EXISTS(SELECT 1 FROM biology_submissions sub WHERE sub.task_id=t.id
                     AND sub.user_id=s.user_id AND sub.submitted_at IS NOT NULL)
                   AND NOT EXISTS(SELECT 1 FROM biology_warning_log w WHERE w.task_id=t.id AND w.user_id=s.user_id)
@@ -6770,6 +6837,7 @@ async def missing_students(task_id):
     return await run(op)
 
 
+
 async def students_pending_task(task_id):
     def op():
         with connect() as conn,conn.cursor() as cur:
@@ -6780,6 +6848,7 @@ async def students_pending_task(task_id):
                 LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
                 WHERE ts.task_id=%s AND s.approved=TRUE AND t.optional_practice=FALSE
                   AND t.retired_obligation=FALSE AND (d.id IS NULL OR d.deleted_at IS NULL)
+                  AND biology_section_accountable(ts.user_id,CASE WHEN t.school_review_id IS NOT NULL THEN 'school_review' WHEN t.kind='exam' THEN 'exams' ELSE 'homework' END)
                   AND NOT EXISTS(SELECT 1 FROM biology_submissions sub WHERE sub.task_id=t.id
                     AND sub.user_id=s.user_id AND sub.submitted_at IS NOT NULL);""",(int(task_id),))
             rows=[]
@@ -6789,6 +6858,7 @@ async def students_pending_task(task_id):
                 rows.append(student)
             return rows
     return await run(op)
+
 
 
 async def due_tasks():
@@ -6812,8 +6882,9 @@ async def recently_closed_tasks_for_warning_recovery(days=30):
     def op():
         with connect() as conn,conn.cursor() as cur:
             cur.execute("""SELECT * FROM biology_tasks WHERE closed=TRUE AND retired_obligation=FALSE
+                AND (kind<>'homework' OR homework_manual_closed=FALSE)
                 AND optional_practice=FALSE AND deadline<=CURRENT_TIMESTAMP
-                AND deadline>=CURRENT_TIMESTAMP-(%s || ' days')::INTERVAL ORDER BY deadline,id;""",
+                AND (kind='homework' OR deadline>=CURRENT_TIMESTAMP-(%s || ' days')::INTERVAL) ORDER BY deadline,id;""",
                 (max(1,min(90,int(days))),)); return cur.fetchall()
     return await run(op)
 
@@ -6926,11 +6997,11 @@ async def v50_database_storage():
                 COALESCE(SUM(pg_total_relation_size(
                     format('%I.%I',schemaname,tablename)::REGCLASS)),0)::BIGINT AS biology_bytes
                 FROM pg_tables WHERE schemaname=current_schema()
-                  AND LEFT(tablename,8)='biology_';""")
-            physics=cur.fetchone()
-            cur.execute("SELECT pg_size_pretty(%s::BIGINT) AS biology_pretty;",(physics['biology_bytes'],))
+                  AND substring(tablename FROM 1 FOR 10)='biology_';""")
+            biology=cur.fetchone()
+            cur.execute("SELECT pg_size_pretty(%s::BIGINT) AS biology_pretty;",(biology['biology_bytes'],))
             pretty=cur.fetchone()['biology_pretty']
-            return {**dict(total),**dict(physics),'biology_pretty':pretty}
+            return {**dict(total),**dict(biology),'biology_pretty':pretty}
     return await run(op)
 
 
@@ -7044,7 +7115,7 @@ def init_db():
 async def v51_preparation_catalog_overrides():
     def op():
         with connect() as conn,conn.cursor() as cur:
-            cur.execute("""SELECT chapter,prep_no,lectures,updated_by,updated_at
+            cur.execute("""SELECT chapter,prep_no,lectures,title,updated_by,updated_at
                 FROM biology_preparation_catalog_overrides ORDER BY chapter,prep_no;""")
             return cur.fetchall()
     return await run(op)
@@ -7098,7 +7169,7 @@ async def v51_set_review_daily_goal(user_id,goal):
                 WHERE user_id=%s
                   AND target_date>(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE
                 ORDER BY target_date,chapter,prep_no,id FOR UPDATE;""",(int(user_id),))
-            future=cur.fetchall(); days={int(value) for value in (row.get('study_days') or [1,3,5,6])}
+            future=cur.fetchall(); days={int(value) for value in (row.get('study_days') or [0,2,6])}
             if future:
                 cur.execute("SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE AS today;")
                 cursor=max((cur.fetchone()['today']+timedelta(days=1)),future[0]['target_date'])
@@ -7350,6 +7421,7 @@ async def v51_daily_tasks(user_id):
                 LEFT JOIN biology_linked_exam_definitions d ON d.id=t.exam_definition_id
                 LEFT JOIN biology_task_extensions e ON e.task_id=t.id AND e.user_id=%s
                 WHERE t.retired_obligation=FALSE AND t.optional_practice=FALSE
+                  AND biology_section_enabled(ts.user_id,CASE WHEN t.school_review_id IS NOT NULL THEN 'school_review' WHEN t.kind='exam' THEN 'exams' ELSE 'homework' END)
                   AND (d.id IS NULL OR d.obligation_retired_at IS NULL)
                   AND ((d.target_scope='course' AND st.study_track='course') OR
                        (d.target_scope='chapter' AND st.study_track='chapter'
@@ -7359,8 +7431,10 @@ async def v51_daily_tasks(user_id):
                             (st.study_track='chapter' AND t.target_scope='chapter_'||st.current_chapter))))
                   AND NOT EXISTS(SELECT 1 FROM biology_submissions sub
                     WHERE sub.task_id=t.id AND sub.user_id=%s AND sub.submitted_at IS NOT NULL)
-                  AND (t.closed=FALSE OR e.extended_until>CURRENT_TIMESTAMP)
-                  AND GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline))>CURRENT_TIMESTAMP
+                  AND ((t.kind='homework' AND t.homework_manual_closed=FALSE
+                        AND (t.homework_opens_at IS NULL OR t.homework_opens_at<=CURRENT_TIMESTAMP))
+                    OR (t.kind='exam' AND (t.closed=FALSE OR e.extended_until>CURRENT_TIMESTAMP)
+                        AND GREATEST(t.deadline,COALESCE(e.extended_until,t.deadline))>CURRENT_TIMESTAMP))
                 ORDER BY t.id,t.deadline;""",(int(user_id),int(user_id),f'student:{int(user_id)}',int(user_id)))
             tasks=cur.fetchall()
             cur.execute("""SELECT r.*,r.due_at<=CURRENT_TIMESTAMP AS due
@@ -7380,6 +7454,7 @@ async def v51_daily_tasks(user_id):
     return await run(op)
 
 
+
 async def v46_cleanup_course_review_history():
     """Retired in v51: royal review now intentionally starts at chapter one."""
     return {"reviews":0,"notifications":0}
@@ -7395,7 +7470,6 @@ async def v51_admin_students():
                 ORDER BY approved DESC,registered_at DESC,user_id;""")
             return cur.fetchall()
     return await run(op)
-
 
 
 async def v51_admin_parents():
@@ -7532,28 +7606,35 @@ async def v52_chapter_exam_bundle(user_id,chapter):
             completed={int(row['lecture']) for row in cur.fetchall()}
             cur.execute("SELECT chapter,lecture FROM biology_lecture_progress WHERE user_id=%s AND completed_at IS NOT NULL;",(int(user_id),))
             completed_pairs={(int(row['chapter']),int(row['lecture'])) for row in cur.fetchall()}
+            current_chapter=int(student.get('current_chapter') or student.get('start_chapter') or 1)
+            if student.get('study_track')=='course':
+                cur.execute('SELECT MAX(chapter) AS chapter FROM biology_preparations WHERE published=TRUE;')
+                current_chapter=max(current_chapter,int((cur.fetchone() or {}).get('chapter') or 1))
+            if student.get('study_track') in {'chapter','course'}:
+                from data import PLAYLISTS
+                for ch,items in PLAYLISTS.items():
+                    if int(ch)<current_chapter:
+                        completed_pairs.update((int(ch),int(item[0])) for item in items)
+                completed.update(lec for ch,lec in completed_pairs if ch==int(chapter))
             cur.execute("""SELECT * FROM biology_linked_exam_definitions
-                WHERE deleted_at IS NULL AND obligation_retired_at IS NULL
-                  AND target_scope=%s ORDER BY created_at,id;""",
-                ('course' if student.get('study_track')=='course' else 'chapter',))
+                WHERE chapter=%s AND deleted_at IS NULL ORDER BY created_at,id;""",(int(chapter),))
             exams=[]
             for definition in cur.fetchall():
                 required=_v52_required_lectures(cur,definition['id'])
-                if not required or not any(ch == int(chapter) for ch, _ in required): continue
+                if not required: continue
                 cur.execute("""SELECT t.*,sub.submitted_at,sub.model_answer_sent_at,
-                        access.status AS approval_status,
-                        GREATEST(t.deadline,COALESCE(ext.extended_until,t.deadline)) AS effective_deadline
+                        access.status AS approval_status
                     FROM biology_tasks t
                     LEFT JOIN biology_submissions sub ON sub.task_id=t.id AND sub.user_id=%s
                     LEFT JOIN biology_exam_access access ON access.task_id=t.id AND access.user_id=%s
-                    LEFT JOIN biology_task_extensions ext ON ext.task_id=t.id AND ext.user_id=%s
                     WHERE t.exam_definition_id=%s AND t.target_scope=%s
                     ORDER BY t.id DESC LIMIT 1;""",
-                    (int(user_id),int(user_id),int(user_id),int(definition['id']),f"student:{int(user_id)}"))
-                task=cur.fetchone(); ready=all((int(chp),int(ch)) in completed_pairs for chp,ch in required)
+                    (int(user_id),int(user_id),int(definition['id']),f"student:{int(user_id)}"))
+                task=cur.fetchone(); ready=(not _section_lectures_required(cur,user_id)) or all((int(chp),int(ch)) in completed_pairs for chp,ch in required)
                 exams.append({**dict(definition),"required":required,"ready":ready,"task":task})
             return {"student":student,"completed":completed,"completed_pairs":completed_pairs,"exams":exams}
     return await run(op)
+
 
 
 async def v52_prepare_chapter_exam(definition_id,user_id):
@@ -7564,26 +7645,15 @@ async def v52_prepare_chapter_exam(definition_id,user_id):
     exam=next((row for row in bundle['exams'] if int(row['id'])==int(definition_id)),None)
     if not exam or not exam['ready']: return {"status":"locked"}
     task=exam.get('task')
-    if not task and definition.get('target_scope')=='course':
-        window=await v47_course_window(int(definition_id))
-        if window.get('status')!='ready': return {'status':'unavailable'}
-        from datetime import datetime, timezone
-        now=datetime.now(timezone.utc)
-        if now<window['publish_at']: return {'status':'scheduled'}
-        if now>=window['deadline']: return {'status':'unavailable'}
-        task=await v29_create_or_get_exam_task(int(definition_id),int(user_id))
-    elif not task:
-        from datetime import datetime, timezone
-        now=datetime.now(timezone.utc)
+    if not task:
+        now_holder={}
+        def now_op():
+            with connect() as conn,conn.cursor() as cur:
+                now_holder['value']=datetime_now(cur)
+        await run(now_op)
+        now=now_holder['value']
         task=await _v47_create_task_atomic(int(definition_id),int(user_id),now,now+timedelta(hours=24),True)
     if not task: return {"status":"missing"}
-    status=await v45_exam_task_status(int(user_id),int(task['id']))
-    if not status or not status.get('track_allowed'): return {'status':'missing'}
-    if status.get('submitted'): return {'status':'submitted','task':task}
-    if status.get('closed') or status['effective_deadline']<=status['now']:
-        return {'status':'closed','task':task}
-    if status.get('exam_available_at') and status['exam_available_at']>status['now']:
-        return {'status':'scheduled'}
     def gate_op():
         with connect() as conn,conn.cursor() as cur:
             cur.execute("SELECT submitted_at FROM biology_submissions WHERE task_id=%s AND user_id=%s;",(int(task['id']),int(user_id)))
@@ -7592,7 +7662,7 @@ async def v52_prepare_chapter_exam(definition_id,user_id):
             cur.execute("SELECT status FROM biology_exam_access WHERE task_id=%s AND user_id=%s;",(int(task['id']),int(user_id)))
             access=cur.fetchone(); approved=bool(access and access['status']=='approved'); notify=not bool(access)
             cur.execute("""UPDATE biology_tasks SET exam_approval_required=TRUE,
-                    exam_pending_activation=%s
+                    exam_pending_activation=%s,closed=FALSE
                 WHERE id=%s RETURNING *;""",(not approved,int(task['id'])))
             updated=cur.fetchone()
             cur.execute("""INSERT INTO biology_exam_access(task_id,user_id,status)
@@ -7735,15 +7805,8 @@ async def v52_current_preparation(user_id):
     """Prefer an unfinished early-unlocked lecture group, otherwise today's real item."""
     def op():
         with connect() as conn,conn.cursor() as cur:
-            cur.execute("SELECT * FROM biology_students WHERE user_id=%s;",(int(user_id),)); student=cur.fetchone()
-            if not student: return None
-            course=student.get('study_track')=='course'
             cur.execute("""SELECT e.*,'early'::TEXT AS source FROM biology_early_preparation_unlocks e
-                WHERE e.user_id=%s AND e.completed_at IS NULL
-                  AND (NOT %s OR e.chapter>3 OR (e.chapter=3 AND NOT EXISTS(
-                    SELECT 1 FROM UNNEST(STRING_TO_ARRAY(e.lectures,',')) value
-                    WHERE value::INTEGER<11)))
-                ORDER BY e.unlocked_at,e.id LIMIT 1;""",(int(user_id),course))
+                WHERE e.user_id=%s AND e.completed_at IS NULL ORDER BY e.unlocked_at,e.id LIMIT 1;""",(int(user_id),))
             early=cur.fetchone()
             if early:
                 lectures=[int(x) for x in early['lectures'].split(',') if x.strip().isdigit()]
@@ -7754,12 +7817,13 @@ async def v52_current_preparation(user_id):
                 return {**dict(early),'target_date':early.get('original_target_date'),
                     'pending_lectures':[n for n in lectures if n not in done],
                     'completed_lectures':[n for n in lectures if n in done],'early':True}
+            cur.execute("SELECT * FROM biology_students WHERE user_id=%s;",(int(user_id),)); student=cur.fetchone()
+            if not student: return None
             today_sql="(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Baghdad')::DATE"
             if student.get('study_track')=='course':
                 cur.execute(f"""SELECT p.*,FALSE AS early FROM biology_preparations p
                     WHERE p.published=TRUE AND p.target_date BETWEEN {today_sql} AND {today_sql}+1
                       AND p.target_date>=COALESCE(%s::DATE,p.target_date)
-                      AND (p.chapter>3 OR (p.chapter=3 AND p.chapter_prep_no>=11))
                     ORDER BY p.target_date DESC,p.published_at DESC NULLS LAST,p.prep_no DESC LIMIT 1;""",
                     (student.get('track_started_on'),))
             else:
@@ -7830,16 +7894,17 @@ async def v52_unlock_next_preparation(user_id):
 
 _v52_previous_preparation_access=v37_preparation_access
 async def v37_preparation_access(user_id,chapter,lecture):
-    def op():
-        with connect() as conn,conn.cursor() as cur:
-            cur.execute("""SELECT * FROM biology_early_preparation_unlocks
-                WHERE user_id=%s AND chapter=%s AND completed_at IS NULL
-                  AND %s=ANY(STRING_TO_ARRAY(lectures,',')::INTEGER[])
-                ORDER BY unlocked_at DESC LIMIT 1;""",(int(user_id),int(chapter),int(lecture)))
-            return cur.fetchone()
-    early=await run(op)
-    if early: return {"allowed":True,"reason":"early","row":early}
-    return await _v52_previous_preparation_access(user_id,chapter,lecture)
+    """Use the same live assignment as Today's Lectures, including edited calendars.
+
+    Never fall back to a stale personal schedule for a course student whose
+    schedule_mode is custom. Early access is already resolved by this provider.
+    """
+    row=await v52_current_preparation(int(user_id))
+    if not row:
+        return {"allowed":False,"reason":"finished","row":None}
+    assigned=set(row.get('pending_lectures') or []) | set(row.get('completed_lectures') or [])
+    allowed=int(row['chapter'])==int(chapter) and int(lecture) in {int(n) for n in assigned}
+    return {"allowed":allowed,"reason":("early" if row.get('early') else "ok") if allowed else "next_only","row":row}
 
 
 _v52_previous_award_preparation=award_daily_preparation
@@ -7863,7 +7928,7 @@ async def award_daily_preparation(user_id,chapter,lecture):
             done=cur.fetchone()
             if early.get('study_track')=='chapter':
                 cur.execute("SELECT study_days,daily_prep_goal FROM biology_students WHERE user_id=%s;",(int(user_id),))
-                student=cur.fetchone() or {}; days={int(value) for value in (student.get('study_days') or [1,3,5,6])}
+                student=cur.fetchone() or {}; days={int(value) for value in (student.get('study_days') or [0,2,6])}
                 goal=max(1,min(5,int(student.get('daily_prep_goal') or 1)))
                 cur.execute("""SELECT pp.* FROM biology_personal_preparations pp
                     WHERE pp.user_id=%s AND EXISTS(
@@ -7923,6 +7988,7 @@ async def delete_parent_account(parent_chat_id):
             cur.execute("SELECT DISTINCT student_id FROM biology_parent_links WHERE parent_chat_id=%s ORDER BY student_id;",(parent_chat_id,))
             affected=[r['student_id'] for r in cur.fetchall()]
             if not affected: return {"status":"not_parent"}
+            cur.execute("DELETE FROM biology_guardian_threads WHERE parent_id=%s;",(parent_chat_id,))
             cur.execute("DELETE FROM biology_parent_links WHERE parent_chat_id=%s;",(parent_chat_id,))
             cur.execute("DELETE FROM biology_communication_routes WHERE chat_id=%s AND role='parent';",(parent_chat_id,))
             for student_id in affected:
@@ -7969,63 +8035,22 @@ def init_db():
             cur.execute("DELETE FROM biology_communication_routes WHERE chat_id=%s AND role='parent';",(parent_id,))
         conn.commit()
 
-
-_reuse_previous_init_db = init_db
-def init_db():
-    _reuse_previous_init_db()
-    from school_exam_upgrade import migrate as migrate_school
-    from exam_reuse import migrate
-    migrate_school(__import__(__name__), 'biology')
-    migrate(__import__(__name__))
-    from exam_difficulty import migrate as migrate_difficulty
-    migrate_difficulty(__import__(__name__))
+# Keep the user-selected calendar active after all legacy aliases.
 
 
-# Parity with the four-bot calendar: selectable 1–7 days and Baghdad dates.
-async def v60_set_study_days(user_id,days,_repair=False):
-    """Chapter students choose 1–7 weekdays; reschedule only unfinished preparations."""
-    days=sorted({int(day) for day in days})
+async def clear_student_topic(user_id, chat_id, expected_thread_id):
+    """Forget only the invalid topic mapping; never erase a newer replacement."""
     def op():
         with connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM biology_students WHERE user_id=%s FOR UPDATE;",(user_id,)); student=cur.fetchone()
-            if not student: return {"status":"missing"}
-            if student.get("study_track")!="chapter": return {"status":"course"}
-            if not student.get("approved") or student.get("reset_pending"): return {"status":"inactive"}
-            chapter=int(student.get("current_chapter") or 1)
-            required=len(days)
-            if not 1<=len(days)<=7 or any(day<0 or day>6 for day in days):
-                return {"status":"count","required":required}
-            cur.execute("""SELECT * FROM biology_personal_preparations
-                WHERE user_id=%s ORDER BY chapter,prep_no,target_date,id FOR UPDATE;""",(user_id,)); rows=cur.fetchall()
-            pending=[]
-            for row in rows:
-                lectures=sorted({int(x) for x in (row.get("lectures") or "").split(",") if x.strip().isdigit()})
-                if not lectures: continue
-                cur.execute("""SELECT COUNT(*) AS n FROM biology_lecture_progress
-                    WHERE user_id=%s AND chapter=%s AND lecture=ANY(%s) AND completed_at IS NOT NULL;""",
-                    (user_id,row["chapter"],lectures))
-                if int(cur.fetchone()["n"])<len(lectures): pending.append(row)
-            pending_ids=[int(row["id"]) for row in pending]
-            occupied={row["target_date"] for row in rows if int(row["id"]) not in set(pending_ids)}
-            if pending_ids:
-                cur.execute("""UPDATE biology_personal_preparations
-                    SET target_date=target_date+10000 WHERE id=ANY(%s);""",(pending_ids,))
-                from datetime import date
-                cursor=datetime.now(ZoneInfo("Asia/Baghdad")).date()-timedelta(days=1)
-                for row in pending:
-                    while True:
-                        cursor += timedelta(days=1)
-                        if cursor.weekday() in days and cursor not in occupied: break
-                    cur.execute("""UPDATE biology_personal_preparations SET target_date=%s,notified=FALSE,notified_at=NULL
-                        WHERE id=%s;""",(cursor,row["id"]))
-                    occupied.add(cursor)
-            cur.execute("""UPDATE biology_students SET schedule_mode='custom',study_days=%s,
-                schedule_change_count=COALESCE(schedule_change_count,0)+1 WHERE user_id=%s RETURNING *;""",(days,user_id)); student=cur.fetchone()
-            conn.commit(); return {"status":"ok","required":required,"student":student,"pending":len(pending)}
+            cur.execute("""DELETE FROM biology_student_topics
+                WHERE user_id=%s AND chat_id=%s AND thread_id=%s;""",
+                (int(user_id), int(chat_id), int(expected_thread_id)))
+            changed = cur.rowcount > 0
+            conn.commit()
+            return changed
     return await run(op)
 
 
-# Override historical fixed-day aliases after all older migrations.
 v41_set_study_days=v60_set_study_days
 async def v10_queued_submission_accepted(task_id,user_id,message_id,file_unique_id):
     """Was this exact file already accepted by the durable outbox?"""
@@ -8037,3 +8062,55 @@ async def v10_queued_submission_accepted(task_id,user_id,message_id,file_unique_
                 (int(task_id),int(user_id),int(message_id),str(file_unique_id)))
             return bool(cur.fetchone()['accepted'])
     return await run(op)
+
+
+_v12_previous_init_db=init_db
+def init_db():
+    _v12_previous_init_db()
+    import sys
+    from assessment_schema import migrate
+    migrate(sys.modules[__name__])
+
+
+def _section_lectures_required(cur,user_id):
+    cur.execute("SELECT biology_section_enabled(%s,'lectures') AS enabled;",(int(user_id),))
+    return bool(cur.fetchone()['enabled'])
+
+
+async def v54_add_school_review(week_no,chapter_label,topics,exam_date,created_by):
+    """Add one future review week from the admin panel.
+
+    Publication is exactly seven days before the exam.  An existing week is
+    never silently overwritten, which protects published schedules.
+    """
+    labels={
+        1:'الأول',2:'الثاني',3:'الثالث',4:'الرابع',5:'الخامس',6:'السادس',
+        7:'السابع',8:'الثامن',9:'التاسع',10:'العاشر',11:'الحادي عشر',
+        12:'الثاني عشر',13:'الثالث عشر',14:'الرابع عشر',15:'الخامس عشر',
+        16:'السادس عشر',17:'السابع عشر',18:'الثامن عشر',19:'التاسع عشر',20:'العشرون',
+    }
+    def op():
+        number=int(week_no)
+        if number<1 or number>60: return {'status':'invalid_week'}
+        exam=exam_date if hasattr(exam_date,'year') else date.fromisoformat(str(exam_date))
+        chapter=str(chapter_label or '').strip(); subject=str(topics or '').strip()
+        if not chapter or not subject: return {'status':'invalid_text'}
+        with connect() as conn,conn.cursor() as cur:
+            cur.execute('SELECT id FROM biology_school_reviews WHERE week_no=%s;',(number,))
+            if cur.fetchone(): return {'status':'exists'}
+            cur.execute("""INSERT INTO biology_school_reviews
+                (week_no,week_label,chapter_label,topics,publish_date,exam_date)
+                VALUES(%s,%s,%s,%s,%s,%s) RETURNING *;""",
+                (number,labels.get(number,f'رقم {number}'),chapter,subject,exam-timedelta(days=7),exam))
+            row=cur.fetchone()
+            cur.execute("INSERT INTO biology_audit(actor_id,action,details) VALUES(%s,'school_review_added',%s);",
+                (int(created_by),f'week={number}; exam={exam.isoformat()}'))
+            conn.commit(); return {'status':'ok','review':row}
+    return await run(op)
+
+
+_bio_parity_previous_init=init_db
+def init_db():
+    _bio_parity_previous_init()
+    from exam_reuse import migrate as migrate_reuse
+    migrate_reuse(__import__(__name__))

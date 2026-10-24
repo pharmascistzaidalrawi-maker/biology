@@ -14,7 +14,7 @@ LOG = logging.getLogger(__name__)
 
 
 def install(ns, db, subject):
-    if subject not in {'biology', 'english', 'chemistry', 'mathematics', 'physics', 'french', 'islamic'}:
+    if subject not in {'biology', 'biology', 'biology', 'mathematics', 'physics', 'french', 'islamic'}:
         raise ValueError('Unknown bot subject')
     B = ns['InlineKeyboardButton']
     K = ns['InlineKeyboardMarkup']
@@ -22,7 +22,7 @@ def install(ns, db, subject):
     is_admin = ns['is_admin']
     old_start = ns['start']
     old_button = ns['button_handler']
-    label = {'biology':'الأحياء', 'english':'الإنكليزي', 'chemistry':'الكيمياء',
+    label = {'biology':'الأحياء', 'biology':'الأحياء', 'biology':'الأحياء',
              'mathematics':'الرياضيات', 'physics':'الفيزياء',
              'french':'الفرنسية', 'islamic':'التربية الإسلامية'}[subject]
     table = f'{subject}_start_role_notifications'
@@ -94,7 +94,7 @@ def install(ns, db, subject):
                      f'🔑 كود ولي الأمر: {code}' if code else '🔑 كود ولي الأمر يظهر بعد التسجيل',
                      '📌 الإشعار من بوت المادة — الطالب فقط']
             # For V9 bots, the group moderator can open the existing lead panel.
-            prefix = {'biology':'bio6', 'english':'eng6', 'chemistry':'chem6',
+            prefix = {'biology':'bio6', 'biology':'bio6', 'biology':'bio6',
                       'mathematics':'math6'}.get(subject)
             markup = K([[B('👤 عرض طلب الطالب', callback_data=f'{prefix}|lead|{uid}')]]) if prefix else None
             # No send to OWNER_CHAT_ID, ADMIN_IDS, or General.
@@ -145,7 +145,7 @@ def install(ns, db, subject):
             context.user_data['start_role'] = 'parent'
             # Remove a stale lead created by an earlier release. Only delete
             # unregistered leads; never touch student records or their codes.
-            if subject in {'biology', 'english', 'chemistry', 'mathematics'}:
+            if subject in {'biology', 'biology', 'biology', 'mathematics'}:
                 def drop_stale_lead():
                     with db.connect() as conn, conn.cursor() as cur:
                         cur.execute(f'''DELETE FROM {subject}_start_leads

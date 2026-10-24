@@ -1,4 +1,4 @@
-"""Unified, compact administrator navigation for Biology and English bots.
+"""Unified, compact administrator navigation for Biology and Biology bots.
 
 Installed last, after legacy UI decorators. Preserves existing callback routes,
 while consolidating entry points into one unambiguous administration hub.
@@ -12,11 +12,11 @@ LOG = logging.getLogger(__name__)
 
 
 def install(ns, db, subject):
-    if subject not in {'biology', 'english'}:
+    if subject not in {'biology', 'biology'}:
         raise ValueError('Unsupported bot')
     B, K = ns['InlineKeyboardButton'], ns['InlineKeyboardMarkup']
     is_admin = ns['is_admin']
-    label = 'الأحياء' if subject == 'biology' else 'الإنكليزي'
+    label = 'الأحياء' if subject == 'biology' else 'الأحياء'
 
     def kb(rows):
         return K(rows)
