@@ -12,10 +12,10 @@ def callback_section(data):
     if data.startswith(('previous|homework|','coursework|homework|')):return 'homework'
     if data.startswith(('current_exams_menu','previous|exam|','coursework|exam|')):return 'exams'
     if data.startswith(('tasks|homework','homework|')):return 'homework'
-    if data.startswith(('today_prep','playlists','chapter|','lecture|','prepopen|','prepwatch|','prepprivate|','prepcomplete|','prepverify|',
+    if data.startswith(('cohort|','today_prep','playlists','chapter|','lecture|','prepopen|','prepwatch|','prepprivate|','prepcomplete|','prepverify|',
         'backlog','royal_review','v42_review','v41_review','v52_unlock','v52_early','weakness','weak_',
         'v55_exam_watch|','v55_exam_study|','v55_exam_oath|','v55_exam_verify|',
-        'gen|','is10|','preview_lecture','bio6|early|','chem6|early|','eng6|early|','isl6|early|','v48_quick_reviews',
+        'pages|','ar6|early|','eng6|early|','math6|early|','phys6|early|','fr6|early|','gen|','is10|','preview_lecture','bio6|early|','chem6|early|','math6|early|','isl6|early|','v48_quick_reviews',
         'edu_plan','study_resources','v48_quick_student','schedules_menu','chapter_completion_schedule','personal_schedule','v37_personal_schedule')):return 'lectures'
     if data.startswith(('tasks|exam','exams_menu','examopen|','v52_exam','v42_bank','v45_',
         'examarchive|','past_exams','exam_menu','v42_exam_bank','course_current_exams','freeextend|',
@@ -40,8 +40,8 @@ def install_keyboard_filter():
     post._student_sections=True;Bot._post=post
 
 def install(ns,db,prefix):
-    if prefix not in ('english','islamic','chemistry','biology'):raise ValueError('Invalid subject')
-    p=prefix;legacy={'english':'eng6','islamic':'isl6','chemistry':'chem6','biology':'bio6'}[p]
+    if prefix not in ('english','islamic','chemistry','biology','mathematics','physics','arabic','french'):raise ValueError('Invalid subject')
+    p=prefix;legacy={'english':'eng6','chemistry':'chem6','islamic':'isl6','biology':'bio6','mathematics':'math6','physics':'phys6','arabic':'ar6','french':'fr6'}[p]
     B,K=ns['InlineKeyboardButton'],ns['InlineKeyboardMarkup']
     install_keyboard_filter()
     async def sql(query,args=(),one=False):
@@ -175,6 +175,12 @@ def install(ns,db,prefix):
         ns[name]=factory(old,name)
 
     # Authoritative data behind the daily requirements, not just button hiding.
+    old_report=db.parent_report_bundle
+    async def section_report(uid,*args,**kwargs):
+        bundle=await old_report(uid,*args,**kwargs);f=await flags(uid)
+        return {**bundle,**{key:[t for t in bundle[key] if f.get(task_section(t),True)] for key in ('current','previous')}}
+    db.parent_report_bundle=ns['parent_report_bundle']=section_report
+
     old_daily=db.v51_daily_tasks
     async def daily(uid):
         bundle=await old_daily(uid);f=await flags(uid)
@@ -246,3 +252,4 @@ def install(ns,db,prefix):
         row=await set_flag(uid,'school_review',actor)
         return {'status':'ok','enabled':row['school_review'],'row':row}
     db.v54_toggle_school_review_student=toggle_school
+

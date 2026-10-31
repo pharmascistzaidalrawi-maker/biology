@@ -97,7 +97,7 @@ def install(ns,db):
     async def listing(q):
         rows=await sql('SELECT * FROM biology_genetics_foundations ORDER BY number;')
         data=await progress(q.from_user.id);done=set(data.get('completed',{}).get(5,[]))
-        text=['🧬 الفصل الخامس — أساسيات الوراثة','الأستاذ سالم آل منصور 2026','محاضرة أسبوعياً يوم الثلاثاء مع الفصلين الثالث والرابع.']
+        text=['🧬 الفصل الخامس — أساسيات الوراثة','الأستاذ سالم آل منصور 2026','محاضرة أسبوعياً يوم الثلاثاء بالتوازي مع خطة الدورة، خارج الاستراحات.']
         buttons=[]
         for r in rows:
             status='✅' if r['number']+39 in done else ('▶️' if r['url'] else '⏳')

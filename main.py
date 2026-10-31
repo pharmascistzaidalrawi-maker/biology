@@ -100,7 +100,7 @@ _OWNER_ERROR_ALERT_AT=0.0
 
 REG_NAME, REG_SCHOOL, REG_GRADE, REG_JOIN = range(4)
 DIV = "━━━━━━━━━━━━━━━━━━"
-BUILD_VERSION = "biology-v15-unified-navigation-20261025"
+BUILD_VERSION = "biology-november-cohort-plan-20261030"
 NEON_ECO_MODE=_env_bool("NEON_ECO_MODE",True)
 NEON_ECO_INTERVAL_SECONDS=max(900,_env_int("NEON_ECO_INTERVAL_SECONDS",1800))
 NEON_BACKGROUND_INTERVAL_SECONDS=max(3600,_env_int("NEON_BACKGROUND_INTERVAL_SECONDS",21600))
@@ -1724,7 +1724,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): await query.answer("هذا القسم للإدارة فقط.",show_alert=True); return
         row=await next_unpublished_preparation()
         info="لا توجد تحاضير قادمة." if not row else f"التحضير القادم: الفصل {row['chapter']} – التحضير {row['chapter_prep_no']}\nالمحاضرات: {row['lectures']}\nالتاريخ: {row['target_date'].strftime('%d/%m/%Y')}"
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⏩ تقديم موعد",callback_data="prep_shift|advance"),InlineKeyboardButton("⏪ تأخير موعد",callback_data="prep_shift|delay")],[InlineKeyboardButton("🏖 إعلان عطلة وتأجيل الجدول",callback_data="prep_holiday")],[InlineKeyboardButton("📅 تاريخ مخصص",callback_data="prep_custom")],[back_menu()]])
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⏩ تقديم موعد",callback_data="prep_shift|advance"),InlineKeyboardButton("⏪ تأخير موعد",callback_data="prep_shift|delay")],[InlineKeyboardButton("🏖 عطلة نصف السنة — 14 يوماً / مرة واحدة",callback_data="prep_holiday")],[InlineKeyboardButton("📅 تاريخ مخصص",callback_data="prep_custom")],[back_menu()]])
         await query.answer(); await query.edit_message_text(bold(f"🗓 إدارة جدول التحاضير\n\n{info}\n\nإذا لم تغيّر شيئاً يبقى الجدول التلقائي كما هو."),parse_mode=ParseMode.HTML,reply_markup=kb); return
     if data.startswith("prep_shift|") or data=="prep_holiday":
         if not is_admin(uid): await query.answer("هذا القسم للإدارة فقط.",show_alert=True); return
@@ -2798,7 +2798,8 @@ def main():
     if not DATABASE_URL: raise RuntimeError("DATABASE_URL is required")
     acquire_single_instance_lock()
     threading.Thread(target=health_server,daemon=True).start()
-    app=Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).post_init(post_init).post_shutdown(post_shutdown).build()
+    from request_reads import ResponsiveApplication
+    app=Application.builder().application_class(ResponsiveApplication).token(BOT_TOKEN).rate_limiter(AIORateLimiter()).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("hwname",hwname_command),group=-3)
     registration=ConversationHandler(
         entry_points=[CommandHandler("start",start), CallbackQueryHandler(role_choice_entry,pattern=r"^start_role\|(student|parent)$"), CallbackQueryHandler(parent_restart_registration,pattern="^parent_restart$"), CallbackQueryHandler(v47_reset_confirm,pattern="^v47_reset_confirm$")],
@@ -2817,6 +2818,7 @@ def main():
     app.add_handler(registration,group=0)
     app.add_handler(CommandHandler("menu",menu_command),group=0)
     app.add_handler(CommandHandler("topics_check",submission_topics_check_command),group=0)
+    app.add_handler(CommandHandler("launchcheck",launchcheck_command),group=0)
     app.add_handler(CommandHandler("cancel",cancel_registration),group=0)
     app.add_handler(CommandHandler("warn",warn_command),group=0)
     app.add_handler(CommandHandler("unwarn",unwarn_command),group=0)
@@ -2850,7 +2852,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),capture_group_task),group=3)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT|filters.PHOTO|filters.Document.ALL|filters.VIDEO),private_messages),group=2)
     app.add_error_handler(error_handler)
-    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=False)
+    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=False,bootstrap_retries=-1)
 
 
 # ========================= v28 CLEAN ACADEMIC OVERRIDES =========================
@@ -6388,7 +6390,7 @@ async def v51_preparation_admin_menu(query):
         [InlineKeyboardButton('✏️ تعديل مجموعات المحاضرات',callback_data='v51_prep_chapters',style='success')],
         [_v51_neutral_button('⏩ تقديم الموعد',callback_data='prep_shift|advance'),
          _v51_neutral_button('⏪ تأخير الموعد',callback_data='prep_shift|delay')],
-        [_v51_neutral_button('🏖 عطلة وتأجيل الجدول',callback_data='prep_holiday'),
+        [_v51_neutral_button('🏖 عطلة نصف السنة — 14 يوماً / مرة واحدة',callback_data='prep_holiday'),
          _v51_neutral_button('📅 تاريخ مخصص',callback_data='prep_custom')],
         [back_menu()]])
     await query.edit_message_text(bold(f'🗓 إدارة مجموعات المحاضرات\n{DIV}\n{current}\n\nالتعديل يحفظ في قاعدة البيانات ويصل إلى جداول الطلاب الحالية والقادمة.'),parse_mode=ParseMode.HTML,reply_markup=kb)
@@ -6816,6 +6818,8 @@ async def v52_unlock_next(query):
     if blocking:
         await query.answer('أكمل الامتحان المطلوب أولا.',show_alert=True); return
     result=await db.v52_unlock_next_preparation(query.from_user.id)
+    if result.get('status')=='cohort_pause':
+        await query.answer(f"الدورة في استراحة؛ المرحلة التالية متاحة يوم {result['available_on']:%d/%m/%Y}.",show_alert=True);return
     messages={
         'finished':'🎉 أكملت جميع محاضرات مسارك الحالي.',
         'current':'أكمل المحاضرات الحالية أولا.',
@@ -7891,6 +7895,11 @@ async def submission_topics_check_command(update, context):
 
 
 async def v11_input_dispatch(update, context):
+    # New homework posts bypass stale private admin input sessions.
+    msg=update.effective_message;user=update.effective_user
+    if (msg and user and is_admin(user.id) and not msg.reply_to_message
+            and update.effective_chat.id==BIOLOGY_GROUP_ID
+            and (msg.message_thread_id or 0)==HOMEWORK_TOPIC_ID):return
     if await v11_input_message(update, context):
         raise ApplicationHandlerStop
 
@@ -7921,6 +7930,27 @@ _install_champion_awards(globals(),db,'biology')
 
 from coursework_navigation import install as _install_coursework_navigation
 _install_coursework_navigation(globals(),db,'biology')
+
+from reliability_oct30 import install as _install_reliability_oct30
+_install_reliability_oct30(globals(),db,'biology')
+
+from learning_insights import install as _install_learning_insights
+_install_learning_insights(globals(),db,'biology')
+
+from efficient_runtime import install as _install_efficient_runtime
+_install_efficient_runtime(globals(),db,'biology')
+
+from biology_launch import install as _install_biology_launch
+_install_biology_launch(globals(),db)
+
+from semester_break import install as _install_semester_break
+_install_semester_break(globals(),db)
+
+from cohort_resume import install as _install_cohort_resume
+_install_cohort_resume(globals(),db)
+
+from request_reads import install as _install_request_reads
+_install_request_reads(db)
 
 if __name__ == "__main__":
     main()

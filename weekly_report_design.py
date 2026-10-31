@@ -111,12 +111,12 @@ class Report:
         self.background()
         self.rect(0, 0, WIDTH, 76, NAVY)
         self.text('منصة المجتهد التعليمية', 561, 30, 13, '#EAD9B8', True)
-        self.text('التقرير الأسبوعي - تتمة', 561, 58, 20, '#FFFFFF', True)
+        self.text(getattr(self,'period_title','التقرير الأسبوعي')+' - تتمة', 561, 58, 20, '#FFFFFF', True)
         self.text(self.label, 34, 52, 12, '#EAD9B8', align='left')
         self.y = 100
 
     def header(self, start, end, number):
-        self.label = 'الأسبوع ' + week_label(number)
+        self.label = getattr(self,'period_label','الأسبوع ' + week_label(number))
         self.rect(0, 0, WIDTH, 180, NAVY)
         self.c.saveState()
         path = self.c.beginPath()
@@ -125,7 +125,7 @@ class Report:
         self.c.drawImage(str(ASSETS/'platform-logo.jpg'), 40, HEIGHT-132, 108, 108, preserveAspectRatio=True)
         self.c.restoreState()
         self.text('منصة المجتهد التعليمية', 561, 43, 17, '#EAD9B8', True)
-        self.text('التقرير الأسبوعي', 561, 96, 35, '#FFFFFF', True)
+        self.text(getattr(self,'period_title','التقرير الأسبوعي'), 561, 96, 35, '#FFFFFF', True)
         self.text('لأداء الطالب ومتابعة الإنجاز', 560, 124, 15, '#CDDBDA')
         self.rect(34, 147, 527, 1, '#365159')
         self.text('الفترة من', 560, 168, 10, '#CDDBDA')
@@ -247,6 +247,13 @@ def build_weekly_pdf(bundle, current_start, current_end, *, metrics, max_warning
     if current['total'] and current['submitted']==current['total']:achievements.append('أكمل جميع الواجبات والامتحانات المطلوبة')
     if current['average'] is not None and current['average']>=90:achievements.append('حقق معدلاً ممتازاً في الامتحانات')
     if not bundle['warnings']:achievements.append('أسبوع كامل بلا إنذارات')
+    activity=bundle.get('activity')
+    if activity:
+        if activity['lectures']:achievements.append(f"أكمل {len(activity['lectures'])} محاضرة خلال الفترة")
+        for kind,noun in [('homework','واجب'),('exam','امتحان')]:
+            count=sum(r['kind']==kind for r in activity['tasks'])
+            if count:achievements.append(f'سلّم {count} {noun} خلال الفترة')
+        if activity['reviews']:achievements.append(f"أكمل {len(activity['reviews'])} مراجعة")
     if not achievements:achievements.append('لا توجد إنجازات خاصة مسجلة هذا الأسبوع')
     warnings=[]
     for w in bundle['warnings']:
@@ -256,6 +263,9 @@ def build_weekly_pdf(bundle, current_start, current_end, *, metrics, max_warning
     report.summary(bundle['student'],current,comparison,max_warnings)
     report.tasks(bundle['current'])
     report.panels(warnings or ['لا توجد إنذارات خلال هذا الأسبوع'],achievements)
+    if bundle.get('activity') is not None:
+        from learning_report_pdf import append_activity
+        append_activity(report,bundle['activity'])
     report.finish()
     buffer.name=weekly_filename(bundle['student']['full_name'],number)
     buffer.seek(0)

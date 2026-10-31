@@ -1,3 +1,18 @@
+> الإصدار الحالي: biology-november-cohort-plan-20261030. ابدأ من COHORT_PLAN_AR.txt ثم RELEASE_GUIDE_AR.txt.
+
+> مراجعة سابقة للأحياء: biology-reviewed-responsive-20261030. ابدأ من RELEASE_GUIDE_AR.txt.
+
+> تحديث التقارير والمتصدرين والأبطال: biology-reports-leaderboards-awards-20261030. راجع LEARNING_FEATURES_AR.txt.
+
+
+> الإصدار الاقتصادي الموحد: biology-efficient-unified-20261030. راجع EFFICIENCY_GUIDE_AR.txt؛ تعليمات الجدولة القديمة تم تجاوزها.
+
+
+> إصلاحات 30/10/2026: راجع OCT30_FIXES_AR.txt. البناء الحالي biology-oct30-session-approval-admin-awards-20261030
+
+
+
+
 > التحديث الحالي: biology-v15-unified-navigation-20261025 — راجع UNIFIED_NAVIGATION_AR.md للتثبيت والقوائم الجديدة.
 
 # الأحياء V13 — أساسيات الوراثة

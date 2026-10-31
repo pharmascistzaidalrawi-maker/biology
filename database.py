@@ -21,11 +21,11 @@ def _env_bool(name,default=False):
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 OWNER_CHAT_ID = _env_int("OWNER_CHAT_ID",0)
-NEON_ECO_MODE = _env_bool("NEON_ECO_MODE",True)
-DB_POOL_MIN = max(0,_env_int("DB_POOL_MIN",0 if NEON_ECO_MODE else 1))
-DB_POOL_MAX = max(DB_POOL_MIN or 1,_env_int("DB_POOL_MAX",4 if NEON_ECO_MODE else 6))
+NEON_ECO_MODE = True  # Shared idle-friendly runtime; do not keep warm connections.
+DB_POOL_MIN = 0 if NEON_ECO_MODE else max(0,_env_int("DB_POOL_MIN",1))
+DB_POOL_MAX = min(2,max(1,_env_int("DB_POOL_MAX",2))) if NEON_ECO_MODE else max(DB_POOL_MIN or 1,_env_int("DB_POOL_MAX",6))
 DB_CONNECT_TIMEOUT = max(3,_env_int("DB_CONNECT_TIMEOUT",10))
-DB_POOL_MAX_IDLE = max(10,_env_int("DB_POOL_MAX_IDLE",120))
+DB_POOL_MAX_IDLE = min(60,max(10,_env_int("DB_POOL_MAX_IDLE",60))) if NEON_ECO_MODE else max(10,_env_int("DB_POOL_MAX_IDLE",120))
 _DB_POOL = None
 _DB_POOL_LOCK = threading.Lock()
 
@@ -984,7 +984,7 @@ async def due_preparations(now):
         local_now = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
         with connect() as conn, conn.cursor() as cur:
             cur.execute("""SELECT * FROM biology_preparations WHERE published=FALSE
-            AND ((target_date - 1) + TIME '23:00') <= %s ORDER BY prep_no;""",(local_now,)); return cur.fetchall()
+            AND ((target_date - 1) + TIME '23:00') <= %s ORDER BY target_date,prep_no;""",(local_now,)); return cur.fetchall()
     return await run(op)
 
 
@@ -1029,26 +1029,63 @@ async def next_unpublished_preparation():
     return await run(op)
 
 
+def _reschedule_biology_calendar(cur,first_date=None,direction=None,earliest_date=None):
+    """Move only unpublished groups, atomically, respecting the teacher's days."""
+    import json
+    from course_schedule_v12 import DAYS
+    cur.execute('LOCK TABLE biology_preparations IN EXCLUSIVE MODE;')
+    cur.execute('SELECT * FROM biology_preparations WHERE published=FALSE ORDER BY target_date,prep_no FOR UPDATE;')
+    rows=cur.fetchall()
+    if not rows:return None
+    cur.execute('SELECT target_date FROM biology_preparations WHERE published=TRUE;')
+    occupied={r['target_date'] for r in cur.fetchall()}
+    cur.execute("SELECT value FROM biology_settings WHERE key='admin_course_days';")
+    saved=cur.fetchone()
+    days=json.loads(saved['value']) if saved and saved['value'] else DAYS
+    if not isinstance(days,list) or not days or not all(type(d) is int and 0<=d<=6 for d in days):
+        raise ValueError('أيام جدول الدورة غير صالحة؛ احفظ أيام الدراسة من إدارة الجدول أولاً.')
+    if direction is not None:
+        if direction not in ('advance','delay'):raise ValueError('اتجاه تعديل الموعد غير صالح.')
+        step=timedelta(days=1 if direction=='delay' else -1)
+        first_date=rows[0]['target_date']+step
+        while first_date.weekday() not in days or first_date in occupied:first_date+=step
+        if earliest_date and first_date<=earliest_date:return 'too_early'
+    # Biology already has chapter/Tuesday genetics bundles. Move dates only.
+    plan=[];day=first_date
+    for row in rows:
+        while day.weekday() not in days or day in occupied:day+=timedelta(days=1)
+        plan.append({**row,'target_date':day});day+=timedelta(days=1)
+    cur.execute("SELECT to_regclass('biology_course_schedule_history') AS name;")
+    if cur.fetchone()['name']:
+        cur.execute("INSERT INTO biology_course_schedule_history(actor_id,rows) SELECT 0,COALESCE(jsonb_agg(to_jsonb(p)),'[]'::jsonb) FROM biology_preparations p;")
+    # Date uniqueness is checked immediately: park beyond all occupied dates first.
+    park=max([r['target_date'] for r in rows]+list(occupied)+[r['target_date'] for r in plan])+timedelta(days=10000)
+    ids=[r['prep_no'] for r in rows]
+    cur.execute("""UPDATE biology_preparations p SET target_date=%s::DATE+moving.position
+        FROM unnest(%s::INTEGER[],%s::INTEGER[]) AS moving(prep_no,position)
+        WHERE p.prep_no=moving.prep_no;""",(park,ids,list(range(len(ids)))))
+    cur.execute("""UPDATE biology_preparations p SET target_date=moving.target_date
+        FROM unnest(%s::INTEGER[],%s::DATE[]) AS moving(prep_no,target_date)
+        WHERE p.prep_no=moving.prep_no;""",(ids,[r['target_date'] for r in plan]))
+    cur.execute("INSERT INTO biology_audit(actor_id,action,details) VALUES(0,'launch_calendar_move',%s);",(f"groups={len(rows)};first={plan[0]['target_date']};published_preserved=true",))
+    cur.execute('SELECT * FROM biology_preparations WHERE prep_no=%s;',(rows[0]['prep_no'],))
+    return cur.fetchone()
+
+
 async def reschedule_unpublished_preparations(first_date):
     def op():
-        with connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM biology_preparations WHERE published=FALSE ORDER BY target_date,prep_no FOR UPDATE;"); rows=cur.fetchall()
-            if not rows: return None
-            cur.execute("UPDATE biology_preparations SET target_date=target_date+10000 WHERE published=FALSE;")
-            current=first_date
-            for row in rows:
-                cur.execute("UPDATE biology_preparations SET target_date=%s WHERE prep_no=%s;",(current,row["prep_no"])); current=_next_study_date(current)
-            conn.commit()
-            cur.execute("SELECT * FROM biology_preparations WHERE prep_no=%s;",(rows[0]["prep_no"],)); return cur.fetchone()
+        with connect() as conn,conn.cursor() as cur:
+            row=_reschedule_biology_calendar(cur,first_date=first_date)
+            conn.commit();return row
     return await run(op)
 
 
 async def shift_unpublished_preparations(direction,earliest_date=None):
-    first=await next_unpublished_preparation()
-    if not first: return None
-    new_date=_next_study_date(first["target_date"]) if direction=="delay" else _previous_study_date(first["target_date"])
-    if earliest_date and new_date<=earliest_date: return "too_early"
-    return await reschedule_unpublished_preparations(new_date)
+    def op():
+        with connect() as conn,conn.cursor() as cur:
+            row=_reschedule_biology_calendar(cur,direction=direction,earliest_date=earliest_date)
+            conn.commit();return row
+    return await run(op)
 
 
 async def create_task(kind,title,chat_id,thread_id,message_id,payload_type,file_id,media_group_id,text_content,deadline,xp_reward,created_by,target_scope="course",linked_lectures=""):
@@ -6204,6 +6241,7 @@ def _v47_required_lectures(cur,definition_id):
 
 def v47_before_start(student,chapter,lecture):
     from data import CHAPTER_PREPARATION_DISTRIBUTION
+    if int(chapter)==4:return False
     start=student.get('start_chapter')
     if student.get('study_track')!='chapter' or not start: return False
     groups=CHAPTER_PREPARATION_DISTRIBUTION.get(int(start),[])
@@ -6997,7 +7035,7 @@ async def v50_database_storage():
                 COALESCE(SUM(pg_total_relation_size(
                     format('%I.%I',schemaname,tablename)::REGCLASS)),0)::BIGINT AS biology_bytes
                 FROM pg_tables WHERE schemaname=current_schema()
-                  AND substring(tablename FROM 1 FOR 10)='biology_';""")
+                  AND left(tablename,length('biology_'))='biology_';""")
             biology=cur.fetchone()
             cur.execute("SELECT pg_size_pretty(%s::BIGINT) AS biology_pretty;",(biology['biology_bytes'],))
             pretty=cur.fetchone()['biology_pretty']
@@ -7608,12 +7646,16 @@ async def v52_chapter_exam_bundle(user_id,chapter):
             completed_pairs={(int(row['chapter']),int(row['lecture'])) for row in cur.fetchall()}
             current_chapter=int(student.get('current_chapter') or student.get('start_chapter') or 1)
             if student.get('study_track')=='course':
-                cur.execute('SELECT MAX(chapter) AS chapter FROM biology_preparations WHERE published=TRUE;')
-                current_chapter=max(current_chapter,int((cur.fetchone() or {}).get('chapter') or 1))
+                if student.get('biology_reordered'):
+                    cur.execute('SELECT chapter FROM biology_preparations WHERE published=TRUE AND cohort_phase>0 ORDER BY target_date DESC LIMIT 1;')
+                    current_chapter=int((cur.fetchone() or {}).get('chapter') or current_chapter)
+                else:
+                    cur.execute('SELECT MAX(chapter) AS chapter FROM biology_preparations WHERE published=TRUE;')
+                    current_chapter=max(current_chapter,int((cur.fetchone() or {}).get('chapter') or 1))
             if student.get('study_track') in {'chapter','course'}:
                 from data import PLAYLISTS
                 for ch,items in PLAYLISTS.items():
-                    if int(ch)<current_chapter:
+                    if int(ch)<current_chapter and int(ch)!=4 and not (student.get('biology_reordered') and student.get('study_track')=='course' and int(ch)==5):
                         completed_pairs.update((int(ch),int(item[0])) for item in items)
                 completed.update(lec for ch,lec in completed_pairs if ch==int(chapter))
             cur.execute("""SELECT * FROM biology_linked_exam_definitions

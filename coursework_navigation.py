@@ -1,8 +1,8 @@
 """Shared subject menus, section visibility and historical-work preview."""
 
 def install(ns,db,p):
-    if p not in ('english','chemistry','islamic','biology'):raise ValueError('Invalid subject')
-    legacy={'english':'eng6','chemistry':'chem6','islamic':'isl6','biology':'bio6'}[p]
+    if p not in ('english','islamic','chemistry','biology','mathematics','physics','arabic','french'):raise ValueError('Invalid subject')
+    legacy={'english':'eng6','chemistry':'chem6','islamic':'isl6','biology':'bio6','mathematics':'math6','physics':'phys6','arabic':'ar6','french':'fr6'}[p]
     B,K=ns['InlineKeyboardButton'],ns['InlineKeyboardMarkup']
     async def sql(text,args=(),one=False):
         def op():
@@ -31,6 +31,8 @@ def install(ns,db,p):
                 if str(button.callback_data or '').startswith(('catchup|','previous|')) or key in seen:continue
                 seen.add(key);buttons.append(button)
         from student_sections import callback_section
+        order={'tasks|homework':0,'exams_menu':1}
+        buttons.sort(key=lambda b:order.get(b.callback_data,2))
         rows=[]
         def take(predicate,width=2):
             group=[b for b in buttons if predicate(b)]

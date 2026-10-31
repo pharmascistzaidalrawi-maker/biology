@@ -4,7 +4,7 @@ METHOD='prior_learning'
 
 def before_boundary(boundary):
     return sorted((int(ch),int(item[0])) for ch,items in PLAYLISTS.items()
-                  for item in items if (int(ch),int(item[0]))<boundary)
+                  for item in items if int(ch)!=4 and (int(ch),int(item[0]))<boundary)
 
 def boundary_for(cur,p,student):
     if student.get('reset_pending') or int(student.get('onboarding_version') or 0)<19:
@@ -18,6 +18,13 @@ def boundary_for(cur,p,student):
         ch=int(student.get('start_chapter') or 1);number=int(student.get('start_prep_no') or 1)
         groups=CHAPTER_PREPARATION_DISTRIBUTION.get(ch,[])
         return (ch,min(groups[number-1])) if 1<=number<=len(groups) else None
+    if student.get('study_track')=='course' and student.get('biology_reordered'):
+        cur.execute(f'''SELECT chapter,lectures FROM {p}_preparations WHERE cohort_phase>0
+            ORDER BY CASE WHEN target_date<=%s::DATE THEN 0 ELSE 1 END,
+            CASE WHEN target_date<=%s::DATE THEN target_date END DESC,target_date,prep_no LIMIT 1;''',
+            (student.get('track_started_on'),student.get('track_started_on')))
+        row=cur.fetchone()
+        return (int(row['chapter']),min(map(int,row['lectures'].split(',')))) if row else None
     if student.get('study_track')=='course':
         # Use the enrollment date, never today's advancing published lecture.
         cur.execute(f'''SELECT chapter,lectures FROM {p}_preparations
@@ -35,6 +42,11 @@ def synchronize(cur,p,uid):
     boundary=boundary_for(cur,p,student)
     if boundary is None:return
     pairs=before_boundary(boundary)
+    reordered=bool(student.get('biology_reordered') and student.get('study_track')=='course')
+    if reordered:
+        pairs=[pair for pair in pairs if pair[0]!=5]
+        cur.execute("DELETE FROM biology_lecture_progress WHERE user_id=%s AND chapter=5 AND completion_method='prior_learning';",(int(uid),))
+    cur.execute("DELETE FROM biology_lecture_progress WHERE user_id=%s AND chapter=4 AND completion_method='prior_learning';",(int(uid),))
     # Remove only inferred completion if the teacher moves the start backwards.
     cur.execute(f'''DELETE FROM {p}_lecture_progress WHERE user_id=%s
         AND completion_method=%s AND (chapter,lecture)>=(%s,%s);''',
@@ -52,7 +64,7 @@ def synchronize(cur,p,uid):
     cur.execute(f"""UPDATE {p}_lecture_reviews r
         SET completed_at=COALESCE(r.completed_at,CURRENT_TIMESTAMP),
             reminded_at=COALESCE(r.reminded_at,CURRENT_TIMESTAMP)
-        WHERE r.user_id=%s AND (r.chapter,r.lecture)<(%s,%s);""",
+        WHERE r.user_id=%s AND r.chapter<>4 AND {('r.chapter<>5 AND ' if reordered else '')}(r.chapter,r.lecture)<(%s,%s);""",
         (int(uid),*boundary))
     # Remove stale inferred review rows if a student's start boundary moves back.
     cur.execute(f"""DELETE FROM {p}_lecture_reviews r

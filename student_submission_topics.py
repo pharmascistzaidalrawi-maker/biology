@@ -30,6 +30,30 @@ def topic_name(student):
     return f'{name} | {uid}'[:128]
 
 
+async def check_destination(bot, chat_id):
+    """Read-only launch check: do not create a topic or send a test answer."""
+    try:
+        cid=int(chat_id or 0)
+    except (TypeError,ValueError):
+        return False,'معرّف مجموعة الحلول غير صالح.'
+    if cid>=0:
+        return False,'اضبط معرّف Supergroup سالبًا ومفعّلاً فيها Topics.'
+    try:
+        chat=await bot.get_chat(cid)
+        if getattr(chat,'type',None)!='supergroup' or not getattr(chat,'is_forum',False):
+            return False,'مجموعة الحلول يجب أن تكون Supergroup مفعّلاً فيها Topics.'
+        me=await bot.get_me()
+        member=await bot.get_chat_member(cid,me.id)
+        status=getattr(member,'status',None)
+        if status not in ('creator','administrator'):
+            return False,'اجعل البوت مشرفًا في مجموعة الحلول.'
+        if status!='creator' and not getattr(member,'can_manage_topics',False):
+            return False,'فعّل صلاحية إدارة المواضيع للبوت في مجموعة الحلول.'
+        return True,'المجموعة منتدى، والبوت مشرف ولديه صلاحية إدارة المواضيع.'
+    except Exception as exc:
+        return False,'تعذر الوصول إلى مجموعة الحلول: '+str(exc)[:300]
+
+
 class StudentTopicRouter:
     def __init__(self, database):
         self.db = database

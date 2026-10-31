@@ -5,6 +5,7 @@ import json
 import logging
 from champion_certificate import render_certificate
 LOG=logging.getLogger(__name__)
+COHORT_SQL="CASE WHEN t.kind='homework' THEN 'task:'||t.id::TEXT ELSE COALESCE('school:'||t.school_review_id::TEXT,'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT) END"
 
 def migrate(db,p):
     with db.connect() as conn,conn.cursor() as cur:
@@ -19,8 +20,8 @@ def migrate(db,p):
         conn.commit()
 
 def install(ns,db,p):
-    assert p in ('chemistry','islamic','biology')
-    ns.setdefault('SUBJECT_NAME',{'chemistry':'الكيمياء','islamic':'التربية الإسلامية','biology':'الأحياء'}[p])
+    assert p in ('english','chemistry','islamic','biology','mathematics','physics','arabic','french')
+    ns.setdefault('SUBJECT_NAME',{'chemistry':'الكيمياء','islamic':'التربية الإسلامية','english':'اللغة الإنجليزية','biology':'الأحياء','mathematics':'الرياضيات','physics':'الفيزياء','arabic':'اللغة العربية','french':'اللغة الفرنسية'}[p])
     old_init=ns['init_db']
     def init():old_init();migrate(db,p)
     ns['init_db']=db.init_db=init
@@ -33,31 +34,31 @@ def install(ns,db,p):
                 return result
         return await db.run(op)
     def cohort(task):
+        if task['kind']=='homework':return 'task:'+str(task['id'])
         return ('school:'+str(task['school_review_id']) if task.get('school_review_id') else
                 'exam:'+str(task['exam_definition_id']) if task.get('exam_definition_id') else 'task:'+str(task['id']))
     async def snapshot(task_id):
         def op():
             with db.connect() as conn,conn.cursor() as cur:
                 cur.execute(f'SELECT * FROM {p}_tasks WHERE id=%s;',(task_id,));t=cur.fetchone()
-                if not t or t['retired_obligation'] or t['optional_practice'] or t.get('catchup_source_id'):return None
+                if not t or t['retired_obligation'] or (t['optional_practice'] and t.get('exam_difficulty')!='hard') or t.get('catchup_source_id'):return None
                 key=cohort(t)
                 cur.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,58));',(key,))
                 cur.execute(f'SELECT * FROM {p}_certificate_cycles WHERE cohort=%s;',(key,));cycle=cur.fetchone()
-                field='school_review_id' if t.get('school_review_id') else 'exam_definition_id' if t.get('exam_definition_id') else 'id'
+                field='id' if t['kind']=='homework' else 'school_review_id' if t.get('school_review_id') else 'exam_definition_id' if t.get('exam_definition_id') else 'id'
                 cur.execute(f'''SELECT t.id,t.closed,GREATEST(t.deadline,COALESCE(MAX(e.extended_until),t.deadline)) AS until,
                     CURRENT_TIMESTAMP AS now FROM {p}_tasks t LEFT JOIN {p}_task_extensions e ON e.task_id=t.id
-                    WHERE t.{field}=%s AND t.retired_obligation=FALSE AND t.optional_practice=FALSE
-                    GROUP BY t.id;''',(t[field],));tasks=cur.fetchall()
+                    WHERE t.{field}=%s AND t.kind=%s AND t.retired_obligation=FALSE AND (t.optional_practice=FALSE OR to_jsonb(t)->>'exam_difficulty'='hard') AND t.catchup_source_id IS NULL
+                    GROUP BY t.id;''',(t[field],t['kind']));tasks=cur.fetchall()
                 # Finish the submission window (including teacher extensions) first.
-                if not tasks or any(r['until']>r['now'] and not r['closed'] for r in tasks):return None
-                ids=[r['id'] for r in tasks]
-                cur.execute(f"SELECT 1 FROM {p}_submission_delivery_outbox WHERE task_id=ANY(%s) AND status='pending' LIMIT 1;",(ids,))
-                if cur.fetchone():return None
+                finished=[r for r in tasks if r['until']<=r['now'] or r['closed']]
+                if not finished or not any(r['id']==t['id'] for r in finished):return None
+                ids=[r['id'] for r in finished]
                 cur.execute(f'''SELECT sub.*,s.full_name,s.parent_chat_id,s.parent_approved FROM {p}_submissions sub
                     JOIN {p}_students s ON s.user_id=sub.user_id
-                    WHERE sub.task_id=ANY(%s) AND sub.submitted_at IS NOT NULL AND sub.rejected=FALSE
+                    WHERE sub.task_id=ANY(%s) AND sub.submitted_at IS NOT NULL AND sub.rejected=FALSE AND sub.grade IS NOT NULL AND sub.revision_open=FALSE AND sub.teacher_change_pending=FALSE
                     ORDER BY sub.grade DESC NULLS LAST,sub.submitted_at,sub.user_id;''',(ids,));entries=cur.fetchall()
-                if not entries or any(e['grade'] is None or e['revision_open'] or e['teacher_change_pending'] for e in entries):return None
+                if not entries:return None
                 top=entries[0]['grade'];winners=[];seen=set()
                 for e in entries:
                     if e['grade']==top and e['user_id'] not in seen:winners.append(e);seen.add(e['user_id'])
@@ -70,7 +71,10 @@ def install(ns,db,p):
                     cur.execute(f'SELECT parent_chat_id FROM {p}_parent_links WHERE student_id=%s AND approved=TRUE;',(uid,))
                     parents=cur.fetchall()
                     targets += [(r['parent_chat_id'],'parent') for r in parents]
-                    if winner.get('parent_chat_id') and winner.get('parent_approved'):targets.append((winner['parent_chat_id'],'parent'))
+                    if winner.get('parent_chat_id') and winner.get('parent_approved'):
+                        cur.execute(f'SELECT approved FROM {p}_parent_links WHERE student_id=%s AND parent_chat_id=%s;',(uid,winner['parent_chat_id']))
+                        explicit=cur.fetchone()
+                        if explicit is None or explicit['approved']:targets.append((winner['parent_chat_id'],'parent'))
                     used=set()
                     for chat,role in targets:
                         if not chat or chat in used:continue
@@ -139,20 +143,23 @@ def install(ns,db,p):
         finally:
             await sql(f'UPDATE {p}_certificate_cycles SET claimed_at=NULL WHERE cohort=%s;',(key,),commit=True)
     async def candidates(days=30):
-        return await sql(f'''SELECT DISTINCT ON (COALESCE('school:'||t.school_review_id::TEXT,
-                'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT)) t.*
-            FROM {p}_tasks t WHERE t.retired_obligation=FALSE AND t.optional_practice=FALSE
+        # Select a finished attempt per assessment, not the earliest still-open copy.
+        return await sql(f'''SELECT DISTINCT ON ({COHORT_SQL}) t.* FROM {p}_tasks t
+            WHERE t.retired_obligation=FALSE AND t.kind IN ('exam','homework')
+                AND (t.optional_practice=FALSE OR to_jsonb(t)->>'exam_difficulty'='hard')
+                AND t.catchup_source_id IS NULL
+                AND (t.closed OR GREATEST(t.deadline,COALESCE((SELECT MAX(e.extended_until)
+                    FROM {p}_task_extensions e WHERE e.task_id=t.id),t.deadline))<=CURRENT_TIMESTAMP)
                 AND (t.champion_announced=FALSE OR EXISTS(SELECT 1 FROM {p}_certificate_deliveries cd
-                    WHERE cd.cohort=COALESCE('school:'||t.school_review_id::TEXT,'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT)
-                    AND cd.sent_signature IS DISTINCT FROM cd.signature)
+                    WHERE cd.cohort=({COHORT_SQL}) AND cd.sent_signature IS DISTINCT FROM cd.signature)
                   OR EXISTS(SELECT 1 FROM {p}_submissions changed WHERE changed.task_id=t.id
                     AND changed.graded_at>COALESCE((SELECT MAX(cd.updated_at) FROM {p}_certificate_deliveries cd
-                      WHERE cd.cohort=COALESCE('school:'||t.school_review_id::TEXT,'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT)),
+                      WHERE cd.cohort=({COHORT_SQL})),
                       (SELECT value::timestamptz FROM {p}_settings WHERE key='certificate_v58_started_at'))))
-                AND t.kind IN ('exam','homework') AND EXISTS(SELECT 1 FROM {p}_submissions sub
-                    WHERE sub.task_id=t.id AND sub.grade IS NOT NULL)
-            ORDER BY COALESCE('school:'||t.school_review_id::TEXT,
-                'exam:'||t.exam_definition_id::TEXT,'task:'||t.id::TEXT),t.id;''')
+                AND EXISTS(SELECT 1 FROM {p}_submissions sub WHERE sub.task_id=t.id
+                    AND sub.submitted_at IS NOT NULL AND sub.grade IS NOT NULL AND sub.rejected=FALSE
+                    AND sub.revision_open=FALSE AND sub.teacher_change_pending=FALSE)
+            ORDER BY ({COHORT_SQL}),t.id;''')
     ns['announce_champions']=announce
     db.closed_exams_pending_champion=ns['closed_exams_pending_champion']=candidates
     db.certificate_snapshot=snapshot

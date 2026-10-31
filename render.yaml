@@ -52,9 +52,9 @@ services:
       - key: DB_POOL_MIN
         value: "0"
       - key: DB_POOL_MAX
-        value: "4"
+        value: "2"
       - key: DB_POOL_MAX_IDLE
-        value: "120"
+        value: "60"
       - key: DB_CONNECT_TIMEOUT
         value: "10"
       - key: NEON_ECO_MODE
